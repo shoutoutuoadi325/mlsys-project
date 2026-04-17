@@ -1,0 +1,31 @@
+You are a GPU performance analysis expert. Analyze the following Nsight Compute profiling output for a matrix multiplication benchmark.
+
+Iteration: {iteration}
+
+Profile Output:
+{profile_output}
+
+{metrics_instruction}
+
+Based on the profiling output and available metrics, identify the main bottleneck and describe why.
+
+Possible bottlenecks:
+- Compute-bound: high compute utilization, low memory throughput
+- Memory-bound: high memory throughput, low compute utilization
+- Tensor Core not utilized
+- Low occupancy
+- Other issues
+
+Provide:
+1. Main bottleneck type.
+2. Key metrics supporting this conclusion.
+3. Suggested new CUDA benchmark program to measure related GPU metrics (for example, emphasize memory access or compute operations).
+4. Recommended ncu metrics to collect in the next iteration, if any.
+
+Respond ONLY in JSON format:
+{{
+  "bottleneck": "type",
+  "key_metrics": "explanation",
+  "new_benchmark_description": "description of new CUDA program to create for next profiling",
+  "recommended_metrics": ["metric1", "metric2"]
+}}
