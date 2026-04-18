@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.config import AgentConfig
-from agent.models import ProbeResult
+from agent.models import ProbeResult, TargetPlan
+from agent.planner import TargetPlanner
 from agent.utils import estimate_confidence, extract_last_json_object, summarize_trials
 from runner.run import (
     aggregate_metric_records,
@@ -34,23 +35,15 @@ class ProbeExecutor:
         self.source_dir.mkdir(parents=True, exist_ok=True)
         self.binary_dir.mkdir(parents=True, exist_ok=True)
         self._compiled: dict[str, PreparedBinary] = {}
+        self._builtin_handlers = self._handlers()
+        self._planner = TargetPlanner(config, list(self._builtin_handlers.keys()))
 
     def run_target(self, target: str) -> ProbeResult:
-        canonical = self._canonical_target(target)
-        handler = self._handlers().get(canonical)
-        if handler is None:
-            return ProbeResult(
-                target=target,
-                status="unsupported",
-                value=None,
-                unit="",
-                method="unsupported-target",
-                confidence=0.0,
-                error=f"No strategy implemented for target: {target}",
-            )
+        plan = self._planner.plan_target(target)
 
         try:
-            result = handler(target)
+            result = self._execute_plan(plan)
+            result.evidence.setdefault("plan", plan.as_dict())
             return result
         except Exception as exc:
             return ProbeResult(
@@ -58,10 +51,33 @@ class ProbeExecutor:
                 status="failed",
                 value=None,
                 unit="",
-                method="probe-execution",
+                method=plan.kind,
                 confidence=0.0,
+                evidence={"plan": plan.as_dict()},
                 error=str(exc),
             )
+
+    def _execute_plan(self, plan: TargetPlan) -> ProbeResult:
+        if plan.kind == "builtin_probe":
+            probe_name = (plan.probe_name or "").strip().lower()
+            handler = self._builtin_handlers.get(probe_name)
+            if handler is None:
+                raise RuntimeError(f"Unknown built-in probe: {probe_name}")
+            return handler(plan.target)
+
+        if plan.kind == "device_attribute":
+            attribute_name = (plan.attribute_name or "").strip().lower()
+            if not attribute_name:
+                raise RuntimeError("Device attribute plan missing attribute_name")
+            return self._probe_device_attribute(plan.target, attribute_name, plan.unit_hint)
+
+        if plan.kind == "ncu_metric":
+            metric_name = (plan.metric_name or "").strip()
+            if not metric_name:
+                raise RuntimeError("NCU metric plan missing metric_name")
+            return self._probe_ncu_metric(plan.target, metric_name, plan.unit_hint)
+
+        raise RuntimeError(f"Unsupported plan kind: {plan.kind}")
 
     def _handlers(self) -> dict[str, Callable[[str], ProbeResult]]:
         return {
@@ -78,6 +94,84 @@ class ProbeExecutor:
             "bank_conflict_penalty_cycles": self._probe_bank_conflict_penalty_cycles,
             "max_shmem_per_block_kb": self._probe_max_shmem_per_block_kb,
         }
+
+    def _probe_device_attribute(self, original_target: str, attribute_name: str, unit_hint: str) -> ProbeResult:
+        prepared = self._prepare_binary("probe_device_attribute", _source_device_attribute())
+        values: list[float] = []
+        evidences: list[dict[str, Any]] = []
+
+        for _ in range(max(1, self.config.max_trials)):
+            payload, evidence = self._run_binary_json(prepared, args=[attribute_name])
+            if "value" not in payload:
+                raise RuntimeError(f"Attribute probe output missing 'value': {payload}")
+            values.append(float(payload["value"]))
+            evidence["payload"] = payload
+            evidences.append(evidence)
+
+        summary = summarize_trials(values)
+        payload_unit = ""
+        if evidences and isinstance(evidences[-1].get("payload"), dict):
+            payload_unit = str(evidences[-1]["payload"].get("unit", "")).strip()
+
+        return self._build_result(
+            target=original_target,
+            value=summary["median"],
+            unit=payload_unit or unit_hint,
+            method=f"device-attribute:{attribute_name}",
+            trials=values,
+            evidence={"attribute_name": attribute_name, "runs": evidences},
+        )
+
+    def _probe_ncu_metric(self, original_target: str, metric_name: str, unit_hint: str) -> ProbeResult:
+        prepared = self._prepare_binary("probe_metric_workload", _source_metric_workload())
+
+        profile = profile_with_ncu(
+            prepared.binary_path,
+            args=["16777216", "30", "1024", "256"],
+            metrics=[metric_name],
+            timeout_s=self.config.profile_timeout_s,
+        )
+
+        records = parse_ncu_csv(profile.stdout)
+        aggregate = aggregate_metric_records(records)
+
+        stats = aggregate.get(metric_name)
+        if stats is None:
+            lowered = metric_name.lower()
+            for key, value in aggregate.items():
+                if key.lower() == lowered:
+                    stats = value
+                    metric_name = key
+                    break
+
+        if stats is None:
+            for key, value in aggregate.items():
+                if key.startswith(metric_name) or metric_name.startswith(key):
+                    stats = value
+                    metric_name = key
+                    break
+
+        if stats is None:
+            raise RuntimeError(
+                f"Requested metric '{metric_name}' not found in ncu output. Available metrics: {sorted(aggregate.keys())}"
+            )
+
+        value = float(stats["median"])
+        unit = str(stats.get("unit", "")).strip() or unit_hint
+
+        return self._build_result(
+            target=original_target,
+            value=value,
+            unit=unit,
+            method=f"ncu-metric:{metric_name}",
+            trials=[value],
+            evidence={
+                "requested_metric": metric_name,
+                "profile_duration_seconds": profile.duration_seconds,
+                "record_count": len(records),
+                "aggregate": aggregate,
+            },
+        )
 
     def _canonical_target(self, target: str) -> str:
         return target.strip().lower()
@@ -1069,6 +1163,132 @@ int main() {
 
     CHECK_CUDA(cudaFree(d_out));
     printf("{\"max_shmem_kb\":%d}\n", low_kb);
+    return 0;
+}
+'''
+
+
+def _source_device_attribute() -> str:
+    return r'''
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <cstring>
+
+#define CHECK_CUDA(call)                                                       \
+    do {                                                                       \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            printf("{\"error\":\"%s\"}\n", cudaGetErrorString(err));      \
+            return 1;                                                          \
+        }                                                                      \
+    } while (0)
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        printf("{\"error\":\"missing attribute name\"}\n");
+        return 1;
+    }
+
+    const char* attr = argv[1];
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+
+    if (strcmp(attr, "fb_bus_width") == 0) {
+        printf("{\"value\":%d,\"unit\":\"bits\"}\n", prop.memoryBusWidth);
+        return 0;
+    }
+
+    if (strcmp(attr, "max_gpu_frequency_khz") == 0) {
+        printf("{\"value\":%d,\"unit\":\"kHz\"}\n", prop.clockRate);
+        return 0;
+    }
+
+    if (strcmp(attr, "max_mem_frequency_khz") == 0) {
+        printf("{\"value\":%d,\"unit\":\"kHz\"}\n", prop.memoryClockRate);
+        return 0;
+    }
+
+    if (strcmp(attr, "sm_count") == 0 || strcmp(attr, "multi_processor_count") == 0) {
+        printf("{\"value\":%d,\"unit\":\"count\"}\n", prop.multiProcessorCount);
+        return 0;
+    }
+
+    printf("{\"error\":\"unsupported attribute\",\"attribute\":\"%s\"}\n", attr);
+    return 1;
+}
+'''
+
+
+def _source_metric_workload() -> str:
+    return r'''
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <cstdlib>
+
+#define CHECK_CUDA(call)                                                       \
+    do {                                                                       \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            printf("{\"error\":\"%s\"}\n", cudaGetErrorString(err));      \
+            return 1;                                                          \
+        }                                                                      \
+    } while (0)
+
+__global__ void metric_workload(float* out, const float* in, int n, int repeat) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int r = 0; r < repeat; ++r) {
+        for (int i = tid; i < n; i += stride) {
+            float v = in[i];
+            v = fmaf(v, 1.000001f, 0.000001f);
+            v = fmaf(v, 0.999999f, 0.000002f);
+            out[i] = v;
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    int n = 1 << 24;
+    int repeat = 30;
+    int blocks = 1024;
+    int threads = 256;
+    if (argc > 1) n = atoi(argv[1]);
+    if (argc > 2) repeat = atoi(argv[2]);
+    if (argc > 3) blocks = atoi(argv[3]);
+    if (argc > 4) threads = atoi(argv[4]);
+
+    float* d_in = nullptr;
+    float* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_in, sizeof(float) * static_cast<size_t>(n)));
+    CHECK_CUDA(cudaMalloc(&d_out, sizeof(float) * static_cast<size_t>(n)));
+    CHECK_CUDA(cudaMemset(d_in, 0, sizeof(float) * static_cast<size_t>(n)));
+
+    metric_workload<<<blocks, threads>>>(d_out, d_in, n, 2);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start_ev, stop_ev;
+    CHECK_CUDA(cudaEventCreate(&start_ev));
+    CHECK_CUDA(cudaEventCreate(&stop_ev));
+    CHECK_CUDA(cudaEventRecord(start_ev));
+
+    metric_workload<<<blocks, threads>>>(d_out, d_in, n, repeat);
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cudaEventRecord(stop_ev));
+    CHECK_CUDA(cudaEventSynchronize(stop_ev));
+    float elapsed_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start_ev, stop_ev));
+
+    CHECK_CUDA(cudaEventDestroy(start_ev));
+    CHECK_CUDA(cudaEventDestroy(stop_ev));
+    CHECK_CUDA(cudaFree(d_in));
+    CHECK_CUDA(cudaFree(d_out));
+
+    printf("{\"elapsed_ms\":%.6f}\n", elapsed_ms);
     return 0;
 }
 '''

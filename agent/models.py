@@ -25,6 +25,30 @@ class ProbeResult:
 
 
 @dataclass
+class TargetPlan:
+    target: str
+    kind: str
+    source: str
+    rationale: str
+    probe_name: str | None = None
+    attribute_name: str | None = None
+    metric_name: str | None = None
+    unit_hint: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "target": self.target,
+            "kind": self.kind,
+            "source": self.source,
+            "rationale": self.rationale,
+            "probe_name": self.probe_name,
+            "attribute_name": self.attribute_name,
+            "metric_name": self.metric_name,
+            "unit_hint": self.unit_hint,
+        }
+
+
+@dataclass
 class AgentRunSummary:
     student_id: str
     started_at: str

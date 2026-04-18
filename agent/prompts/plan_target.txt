@@ -1,0 +1,22 @@
+You are planning how to measure one GPU target metric.
+
+Target: {target}
+Built-in probes available: {builtin_probe_names}
+
+Return ONLY valid JSON with this exact schema:
+{{
+  "kind": "builtin_probe|device_attribute|ncu_metric",
+  "probe_name": "string or empty",
+  "attribute_name": "string or empty",
+  "metric_name": "string or empty",
+  "unit_hint": "short unit hint, optional",
+  "rationale": "one short sentence"
+}}
+
+Rules:
+1. Prefer kind="builtin_probe" only if target is directly measurable by one built-in probe.
+2. If target matches device__attribute_* naming, use kind="device_attribute" and set attribute_name to the suffix after device__attribute_.
+3. If target looks like an Nsight Compute metric (contains '__' and dot segments), use kind="ncu_metric" and metric_name equal to the target.
+4. For launch__sm_count, map to kind="builtin_probe" with probe_name="physical_sm_count".
+5. If uncertain, choose kind="ncu_metric" with metric_name equal to the target.
+6. Do not include markdown code fences.

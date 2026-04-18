@@ -1,0 +1,15 @@
+You are summarizing GPU probe results for an engineering report.
+
+Given the JSON payload below, write concise text with exactly three sections:
+1) Key Findings
+2) Confidence Caveats
+3) Next Probes
+
+Constraints:
+- Mention failed/unsupported targets explicitly.
+- Do not fabricate values.
+- If all values are null, state that clearly.
+- Keep under 250 words.
+
+Payload JSON:
+{payload_json}

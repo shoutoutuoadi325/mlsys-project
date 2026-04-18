@@ -12,6 +12,7 @@ class AgentConfig:
     output_path: Path
     state_path: Path
     generated_dir: Path
+    prompt_dir: Path
     compile_timeout_s: int
     run_timeout_s: int
     profile_timeout_s: int
@@ -45,6 +46,7 @@ def load_config() -> AgentConfig:
     output_path = Path(os.getenv("OUTPUT_PATH", str(_resolve_default_output_path(root_dir))))
     state_path = Path(os.getenv("STATE_PATH", str(root_dir / ".agent_state.json")))
     generated_dir = Path(os.getenv("GENERATED_DIR", str(root_dir / ".generated")))
+    prompt_dir = Path(os.getenv("PROMPT_DIR", str(root_dir / "agent" / "prompts")))
 
     compile_timeout_s = int(os.getenv("COMPILE_TIMEOUT_S", "240"))
     run_timeout_s = int(os.getenv("RUN_TIMEOUT_S", "240"))
@@ -58,6 +60,7 @@ def load_config() -> AgentConfig:
         output_path=output_path,
         state_path=state_path,
         generated_dir=generated_dir,
+        prompt_dir=prompt_dir,
         compile_timeout_s=compile_timeout_s,
         run_timeout_s=run_timeout_s,
         profile_timeout_s=profile_timeout_s,
