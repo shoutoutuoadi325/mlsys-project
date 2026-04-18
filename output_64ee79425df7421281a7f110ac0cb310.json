@@ -1,0 +1,509 @@
+{
+  "details": {
+    "device__attribute_fb_bus_width": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "attribute_name": "fb_bus_width",
+        "plan": {
+          "attribute_name": "fb_bus_width",
+          "kind": "device_attribute",
+          "metric_name": null,
+          "probe_name": null,
+          "rationale": "Target is a device attribute for frame buffer bus width.",
+          "source": "llm",
+          "target": "device__attribute_fb_bus_width",
+          "unit_hint": "bits"
+        },
+        "runs": [
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute fb_bus_width",
+            "duration_seconds": 0.05658598701120354,
+            "payload": {
+              "unit": "bits",
+              "value": 384
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":384,\"unit\":\"bits\"}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute fb_bus_width",
+            "duration_seconds": 0.05618356302147731,
+            "payload": {
+              "unit": "bits",
+              "value": 384
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":384,\"unit\":\"bits\"}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute fb_bus_width",
+            "duration_seconds": 0.05571443197550252,
+            "payload": {
+              "unit": "bits",
+              "value": 384
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":384,\"unit\":\"bits\"}\n"
+          }
+        ]
+      },
+      "method": "device-attribute:fb_bus_width",
+      "status": "ok",
+      "summary": {
+        "max": 384.0,
+        "mean": 384.0,
+        "median": 384.0,
+        "min": 384.0,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        384.0,
+        384.0,
+        384.0
+      ],
+      "unit": "bits",
+      "value": 384.0
+    },
+    "device__attribute_max_gpu_frequency_khz": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "attribute_name": "max_gpu_frequency_khz",
+        "plan": {
+          "attribute_name": "max_gpu_frequency_khz",
+          "kind": "device_attribute",
+          "metric_name": null,
+          "probe_name": null,
+          "rationale": "Target follows the device__attribute_* naming pattern.",
+          "source": "llm",
+          "target": "device__attribute_max_gpu_frequency_khz",
+          "unit_hint": "kHz"
+        },
+        "runs": [
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute max_gpu_frequency_khz",
+            "duration_seconds": 0.05324898101389408,
+            "payload": {
+              "unit": "kHz",
+              "value": 1695000
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":1695000,\"unit\":\"kHz\"}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute max_gpu_frequency_khz",
+            "duration_seconds": 0.052344441995956004,
+            "payload": {
+              "unit": "kHz",
+              "value": 1695000
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":1695000,\"unit\":\"kHz\"}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute max_gpu_frequency_khz",
+            "duration_seconds": 0.0309529309743084,
+            "payload": {
+              "unit": "kHz",
+              "value": 1695000
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":1695000,\"unit\":\"kHz\"}\n"
+          }
+        ]
+      },
+      "method": "device-attribute:max_gpu_frequency_khz",
+      "status": "ok",
+      "summary": {
+        "max": 1695000.0,
+        "mean": 1695000.0,
+        "median": 1695000.0,
+        "min": 1695000.0,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        1695000.0,
+        1695000.0,
+        1695000.0
+      ],
+      "unit": "kHz",
+      "value": 1695000.0
+    },
+    "device__attribute_max_mem_frequency_khz": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "attribute_name": "max_mem_frequency_khz",
+        "plan": {
+          "attribute_name": "max_mem_frequency_khz",
+          "kind": "device_attribute",
+          "metric_name": null,
+          "probe_name": null,
+          "rationale": "Target matches the device attribute naming pattern.",
+          "source": "llm",
+          "target": "device__attribute_max_mem_frequency_khz",
+          "unit_hint": "kHz"
+        },
+        "runs": [
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute max_mem_frequency_khz",
+            "duration_seconds": 0.0566492100188043,
+            "payload": {
+              "unit": "kHz",
+              "value": 9751000
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":9751000,\"unit\":\"kHz\"}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute max_mem_frequency_khz",
+            "duration_seconds": 0.05814171800739132,
+            "payload": {
+              "unit": "kHz",
+              "value": 9751000
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":9751000,\"unit\":\"kHz\"}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_device_attribute max_mem_frequency_khz",
+            "duration_seconds": 0.03191972401691601,
+            "payload": {
+              "unit": "kHz",
+              "value": 9751000
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"value\":9751000,\"unit\":\"kHz\"}\n"
+          }
+        ]
+      },
+      "method": "device-attribute:max_mem_frequency_khz",
+      "status": "ok",
+      "summary": {
+        "max": 9751000.0,
+        "mean": 9751000.0,
+        "median": 9751000.0,
+        "min": 9751000.0,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        9751000.0,
+        9751000.0,
+        9751000.0
+      ],
+      "unit": "kHz",
+      "value": 9751000.0
+    },
+    "dram__bytes_read.sum.per_second": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "aggregate": {
+          "dram__bytes_read.sum.per_second": {
+            "count": 1,
+            "max": 850805207349.38,
+            "median": 850805207349.38,
+            "min": 850805207349.38,
+            "unit": "byte/second"
+          }
+        },
+        "benchmark_path": "/workspace/.generated/sources/probe_metric_llm_85632bcfe41d.cu",
+        "benchmark_source": "llm_generated",
+        "generation": {
+          "attempts": [
+            {
+              "attempt": 1,
+              "compiled": true,
+              "name": "probe_metric_llm_85632bcfe41d",
+              "source_hash": "85632bcfe41df6290c8ce21628e780be9f677fb4715094819abc9b7748727501"
+            }
+          ]
+        },
+        "matched_metric": "dram__bytes_read.sum.per_second",
+        "plan": {
+          "attribute_name": null,
+          "kind": "ncu_metric",
+          "metric_name": "dram__bytes_read.sum.per_second",
+          "probe_name": null,
+          "rationale": "Target is a standard Nsight Compute metric for DRAM read bandwidth.",
+          "source": "llm",
+          "target": "dram__bytes_read.sum.per_second",
+          "unit_hint": "GB/s"
+        },
+        "profile_duration_seconds": 1.450079829985043,
+        "record_count": 1,
+        "requested_metric": "dram__bytes_read.sum.per_second"
+      },
+      "method": "ncu-metric-llm-benchmark:dram__bytes_read.sum.per_second",
+      "status": "ok",
+      "summary": {
+        "max": 850805207349.38,
+        "mean": 850805207349.38,
+        "median": 850805207349.38,
+        "min": 850805207349.38,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        850805207349.38
+      ],
+      "unit": "byte/second",
+      "value": 850805207349.38
+    },
+    "dram__bytes_write.sum.per_second": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "aggregate": {
+          "dram__bytes_write.sum.per_second": {
+            "count": 2,
+            "max": 365409038895.37,
+            "median": 365250907259.41003,
+            "min": 365092775623.45,
+            "unit": "byte/second"
+          }
+        },
+        "benchmark_path": "/workspace/.generated/sources/probe_metric_llm_db73e5afc6ab.cu",
+        "benchmark_source": "llm_generated",
+        "generation": {
+          "attempts": [
+            {
+              "attempt": 1,
+              "compiled": true,
+              "name": "probe_metric_llm_db73e5afc6ab",
+              "source_hash": "db73e5afc6ab51cccdd8747768d5bd9160e4944bfd0c91e4739a886617049799"
+            }
+          ]
+        },
+        "matched_metric": "dram__bytes_write.sum.per_second",
+        "plan": {
+          "attribute_name": null,
+          "kind": "ncu_metric",
+          "metric_name": "dram__bytes_write.sum.per_second",
+          "probe_name": null,
+          "rationale": "Target is a standard Nsight Compute metric for write bandwidth.",
+          "source": "llm",
+          "target": "dram__bytes_write.sum.per_second",
+          "unit_hint": "B/s"
+        },
+        "profile_duration_seconds": 3.803718207986094,
+        "record_count": 2,
+        "requested_metric": "dram__bytes_write.sum.per_second"
+      },
+      "method": "ncu-metric-llm-benchmark:dram__bytes_write.sum.per_second",
+      "status": "ok",
+      "summary": {
+        "max": 365250907259.41003,
+        "mean": 365250907259.41003,
+        "median": 365250907259.41003,
+        "min": 365250907259.41003,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        365250907259.41003
+      ],
+      "unit": "byte/second",
+      "value": 365250907259.41003
+    },
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "aggregate": {
+          "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed": {
+            "count": 2,
+            "max": 88.96,
+            "median": 88.63,
+            "min": 88.3,
+            "unit": "%"
+          }
+        },
+        "benchmark_path": "/workspace/.generated/sources/probe_metric_llm_2425647d7acb.cu",
+        "benchmark_source": "llm_generated",
+        "generation": {
+          "attempts": [
+            {
+              "attempt": 1,
+              "compiled": true,
+              "name": "probe_metric_llm_2425647d7acb",
+              "source_hash": "2425647d7acb86ba033013259afd594b7f969d1275bfef52e77f76da3422342c"
+            }
+          ]
+        },
+        "matched_metric": "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+        "plan": {
+          "attribute_name": null,
+          "kind": "ncu_metric",
+          "metric_name": "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+          "probe_name": null,
+          "rationale": "Target is an Nsight Compute metric with '__' and dot-separated segments.",
+          "source": "llm",
+          "target": "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+          "unit_hint": "%"
+        },
+        "profile_duration_seconds": 2.621165757009294,
+        "record_count": 2,
+        "requested_metric": "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
+      },
+      "method": "ncu-metric-llm-benchmark:gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+      "status": "ok",
+      "summary": {
+        "max": 88.63,
+        "mean": 88.63,
+        "median": 88.63,
+        "min": 88.63,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        88.63
+      ],
+      "unit": "%",
+      "value": 88.63
+    },
+    "launch__sm_count": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "plan": {
+          "attribute_name": null,
+          "kind": "builtin_probe",
+          "metric_name": null,
+          "probe_name": "physical_sm_count",
+          "rationale": "launch__sm_count directly corresponds to the physical SM count probe.",
+          "source": "llm",
+          "target": "launch__sm_count",
+          "unit_hint": "SM"
+        },
+        "runs": [
+          {
+            "command": "/workspace/.generated/bin/probe_physical_sm_count",
+            "duration_seconds": 0.3309551310085226,
+            "payload": {
+              "sm_count": 82
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"sm_count\":82}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_physical_sm_count",
+            "duration_seconds": 0.2569825369864702,
+            "payload": {
+              "sm_count": 82
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"sm_count\":82}\n"
+          },
+          {
+            "command": "/workspace/.generated/bin/probe_physical_sm_count",
+            "duration_seconds": 0.25558282097335905,
+            "payload": {
+              "sm_count": 82
+            },
+            "stderr_tail": "",
+            "stdout_tail": "{\"sm_count\":82}\n"
+          }
+        ]
+      },
+      "method": "smid-discovery-kernel",
+      "status": "ok",
+      "summary": {
+        "max": 82.0,
+        "mean": 82.0,
+        "median": 82.0,
+        "min": 82.0,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        82.0,
+        82.0,
+        82.0
+      ],
+      "unit": "count",
+      "value": 82.0
+    },
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+      "confidence": 0.95,
+      "error": null,
+      "evidence": {
+        "aggregate": {
+          "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+            "count": 2,
+            "max": 50.93,
+            "median": 50.82,
+            "min": 50.71,
+            "unit": "%"
+          }
+        },
+        "benchmark_path": "/workspace/.generated/sources/probe_metric_llm_ab74bbfc66f4.cu",
+        "benchmark_source": "llm_generated",
+        "generation": {
+          "attempts": [
+            {
+              "attempt": 1,
+              "compiled": true,
+              "name": "probe_metric_llm_ab74bbfc66f4",
+              "source_hash": "ab74bbfc66f4e031fb0ad7d8ef6c59b027a287b7897f3be360f1adb7b05ca884"
+            }
+          ]
+        },
+        "matched_metric": "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+        "plan": {
+          "attribute_name": null,
+          "kind": "ncu_metric",
+          "metric_name": "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+          "probe_name": null,
+          "rationale": "This target is a standard Nsight Compute metric for SM throughput relative to peak.",
+          "source": "llm",
+          "target": "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+          "unit_hint": "%"
+        },
+        "profile_duration_seconds": 3.059103467006935,
+        "record_count": 2,
+        "requested_metric": "sm__throughput.avg.pct_of_peak_sustained_elapsed"
+      },
+      "method": "ncu-metric-llm-benchmark:sm__throughput.avg.pct_of_peak_sustained_elapsed",
+      "status": "ok",
+      "summary": {
+        "max": 50.82,
+        "mean": 50.82,
+        "median": 50.82,
+        "min": 50.82,
+        "spread_ratio": 0.0,
+        "stdev": 0.0
+      },
+      "trials": [
+        50.82
+      ],
+      "unit": "%",
+      "value": 50.82
+    }
+  },
+  "reasoning": "**Key Findings**  \nAll eight GPU probes succeeded. Measured values: frame buffer bus width = 384 bits; max GPU frequency = 1695 MHz; max memory frequency = 9751 MHz; DRAM read bandwidth = ~851 GB/s; DRAM write bandwidth = ~365 GB/s; GPU memory throughput = 88.6% of peak; SM count = 82; SM throughput = 50.8% of peak. No failed or unsupported targets.\n\n**Confidence Caveats**  \nAll results have high confidence (0.95) and show zero spread across trials, indicating consistent measurement. However, confidence is based on automated probe execution; underlying driver or toolchain inaccuracies are not ruled out.\n\n**Next Probes**  \nSuggested follow-ups: L1/L2 cache bandwidth, tensor core utilization (if applicable), and GPU power draw under load to complement the memory and SM throughput profiles.",
+  "results": {
+    "device__attribute_fb_bus_width": 384.0,
+    "device__attribute_max_gpu_frequency_khz": 1695000.0,
+    "device__attribute_max_mem_frequency_khz": 9751000.0,
+    "dram__bytes_read.sum.per_second": 850805207349.38,
+    "dram__bytes_write.sum.per_second": 365250907259.41003,
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed": 88.63,
+    "launch__sm_count": 82.0,
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 50.82
+  },
+  "student_id": "23302010025",
+  "summary": {
+    "duration_seconds": 687.5979469179874,
+    "failure_count": 0,
+    "finished_at": "2026-04-18T04:59:20.716054+00:00",
+    "started_at": "2026-04-18T04:47:53.118097+00:00",
+    "success_count": 8,
+    "target_count": 8
+  },
+  "target_spec_path": "/target/target_spec.json"
+}
