@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -11,6 +12,7 @@ from agent.config import AgentConfig
 from agent.models import ProbeResult, TargetPlan
 from agent.planner import TargetPlanner
 from agent.utils import estimate_confidence, extract_last_json_object, summarize_trials
+from llm.openai_client import get_openai_client
 from runner.run import (
     aggregate_metric_records,
     compile_cuda_source,
@@ -37,6 +39,11 @@ class ProbeExecutor:
         self._compiled: dict[str, PreparedBinary] = {}
         self._builtin_handlers = self._handlers()
         self._planner = TargetPlanner(config, list(self._builtin_handlers.keys()))
+        self._llm_client = get_openai_client()
+        self._llm_model = os.getenv("BASE_MODEL", "").strip()
+        llm_flag = os.getenv("LLM_BENCHMARK_ENABLED", "1").strip().lower()
+        self._llm_benchmark_enabled = llm_flag not in {"0", "false", "no"}
+        self._llm_benchmark_enabled = self._llm_benchmark_enabled and self._llm_client is not None and bool(self._llm_model)
 
     def run_target(self, target: str) -> ProbeResult:
         plan = self._planner.plan_target(target)
@@ -123,6 +130,18 @@ class ProbeExecutor:
         )
 
     def _probe_ncu_metric(self, original_target: str, metric_name: str, unit_hint: str) -> ProbeResult:
+        if self._llm_benchmark_enabled:
+            try:
+                return self._probe_ncu_metric_llm_generated(original_target, metric_name, unit_hint)
+            except Exception as exc:
+                fallback = self._probe_ncu_metric_static(original_target, metric_name, unit_hint)
+                fallback.evidence["llm_benchmark_error"] = str(exc)
+                fallback.evidence["llm_benchmark_fallback"] = True
+                return fallback
+
+        return self._probe_ncu_metric_static(original_target, metric_name, unit_hint)
+
+    def _probe_ncu_metric_static(self, original_target: str, metric_name: str, unit_hint: str) -> ProbeResult:
         prepared = self._prepare_binary("probe_metric_workload", _source_metric_workload())
 
         profile = profile_with_ncu(
@@ -135,22 +154,7 @@ class ProbeExecutor:
         records = parse_ncu_csv(profile.stdout)
         aggregate = aggregate_metric_records(records)
 
-        stats = aggregate.get(metric_name)
-        if stats is None:
-            lowered = metric_name.lower()
-            for key, value in aggregate.items():
-                if key.lower() == lowered:
-                    stats = value
-                    metric_name = key
-                    break
-
-        if stats is None:
-            for key, value in aggregate.items():
-                if key.startswith(metric_name) or metric_name.startswith(key):
-                    stats = value
-                    metric_name = key
-                    break
-
+        matched_metric, stats = self._match_metric_stats(aggregate, metric_name)
         if stats is None:
             raise RuntimeError(
                 f"Requested metric '{metric_name}' not found in ncu output. Available metrics: {sorted(aggregate.keys())}"
@@ -163,15 +167,175 @@ class ProbeExecutor:
             target=original_target,
             value=value,
             unit=unit,
-            method=f"ncu-metric:{metric_name}",
+            method=f"ncu-metric:{matched_metric}",
             trials=[value],
             evidence={
                 "requested_metric": metric_name,
+                "matched_metric": matched_metric,
                 "profile_duration_seconds": profile.duration_seconds,
                 "record_count": len(records),
                 "aggregate": aggregate,
+                "benchmark_source": "builtin_metric_workload",
             },
         )
+
+    def _probe_ncu_metric_llm_generated(self, original_target: str, metric_name: str, unit_hint: str) -> ProbeResult:
+        prepared, generation = self._prepare_llm_metric_binary(original_target, metric_name)
+
+        profile = profile_with_ncu(
+            prepared.binary_path,
+            args=None,
+            metrics=[metric_name],
+            timeout_s=self.config.profile_timeout_s,
+        )
+
+        records = parse_ncu_csv(profile.stdout)
+        aggregate = aggregate_metric_records(records)
+        matched_metric, stats = self._match_metric_stats(aggregate, metric_name)
+        if stats is None:
+            raise RuntimeError(
+                f"Requested metric '{metric_name}' not found in ncu output. Available metrics: {sorted(aggregate.keys())}"
+            )
+
+        value = float(stats["median"])
+        unit = str(stats.get("unit", "")).strip() or unit_hint
+
+        return self._build_result(
+            target=original_target,
+            value=value,
+            unit=unit,
+            method=f"ncu-metric-llm-benchmark:{matched_metric}",
+            trials=[value],
+            evidence={
+                "requested_metric": metric_name,
+                "matched_metric": matched_metric,
+                "profile_duration_seconds": profile.duration_seconds,
+                "record_count": len(records),
+                "aggregate": aggregate,
+                "benchmark_source": "llm_generated",
+                "benchmark_path": str(prepared.source_path),
+                "generation": generation,
+            },
+        )
+
+    def _prepare_llm_metric_binary(self, target: str, metric_name: str) -> tuple[PreparedBinary, dict[str, Any]]:
+        if self._llm_client is None or not self._llm_model:
+            raise RuntimeError("LLM benchmark generation is disabled or OpenAI client is unavailable")
+
+        last_error: str | None = None
+        attempts: list[dict[str, Any]] = []
+
+        for attempt in range(1, 4):
+            source = self._generate_llm_benchmark_source(target=target, metric_name=metric_name, error_context=last_error)
+            source_hash = self._hash_text(source)
+            name = f"probe_metric_llm_{source_hash[:12]}"
+
+            attempt_evidence: dict[str, Any] = {
+                "attempt": attempt,
+                "name": name,
+                "source_hash": source_hash,
+            }
+
+            try:
+                prepared = self._prepare_binary(name, source)
+                attempt_evidence["compiled"] = True
+                attempts.append(attempt_evidence)
+                return prepared, {"attempts": attempts}
+            except Exception as exc:
+                attempt_evidence["compiled"] = False
+                attempt_evidence["error"] = str(exc)
+                attempts.append(attempt_evidence)
+                last_error = str(exc)
+
+        raise RuntimeError(f"Failed to compile LLM-generated benchmark for metric '{metric_name}'")
+
+    def _generate_llm_benchmark_source(self, *, target: str, metric_name: str, error_context: str | None) -> str:
+        if self._llm_client is None or not self._llm_model:
+            raise RuntimeError("LLM benchmark generation requested but client/model is unavailable")
+
+        prompt_path = self.config.prompt_dir / "generate_benchmark.txt"
+        if prompt_path.exists():
+            template = prompt_path.read_text(encoding="utf-8")
+        else:
+            template = (
+                "Generate a complete CUDA benchmark source file (.cu).\\n"
+                "Target label: {target}\\n"
+                "Primary metric: {metric_name}\\n"
+                "Requirements:\\n"
+                "- Return raw CUDA source only (no markdown).\\n"
+                "- Include at least one __global__ kernel and a main function.\\n"
+                "- Compile with nvcc -O3 -std=c++17.\\n"
+                "- No command-line arguments are required.\\n"
+                "- Print one JSON line at the end: {{\"status\":\"ok\",\"elapsed_ms\":number}}.\\n"
+                "- Do not use #include <cuda/wmma.hpp>.\\n"
+                "Previous error to fix (if any):\\n{error_context}\\n"
+            )
+
+        prompt = template.format(
+            target=target,
+            metric_name=metric_name,
+            error_context=error_context or "none",
+        )
+
+        response = self._llm_client.chat.completions.create(
+            model=self._llm_model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("LLM returned empty benchmark source")
+
+        source = self._extract_code_block(content)
+        if "__global__" not in source or "main(" not in source:
+            raise RuntimeError("Generated benchmark source is missing a CUDA kernel or main()")
+
+        return source
+
+    def _extract_code_block(self, text: str) -> str:
+        stripped = text.strip()
+        cuda_fence = "```cuda"
+        if cuda_fence in stripped:
+            start = stripped.find(cuda_fence) + len(cuda_fence)
+            end = stripped.find("```", start)
+            if end == -1:
+                end = len(stripped)
+            return stripped[start:end].strip()
+
+        generic_fence = "```"
+        if generic_fence in stripped:
+            start = stripped.find(generic_fence) + len(generic_fence)
+            end = stripped.find(generic_fence, start)
+            if end == -1:
+                end = len(stripped)
+            return stripped[start:end].strip()
+
+        return stripped
+
+    def _match_metric_stats(
+        self,
+        aggregate: dict[str, dict[str, Any]],
+        metric_name: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        stats = aggregate.get(metric_name)
+        matched_metric = metric_name
+
+        if stats is None:
+            lowered = metric_name.lower()
+            for key, value in aggregate.items():
+                if key.lower() == lowered:
+                    stats = value
+                    matched_metric = key
+                    break
+
+        if stats is None:
+            for key, value in aggregate.items():
+                if key.startswith(metric_name) or metric_name.startswith(key):
+                    stats = value
+                    matched_metric = key
+                    break
+
+        return matched_metric, stats
 
     def _canonical_target(self, target: str) -> str:
         return target.strip().lower()

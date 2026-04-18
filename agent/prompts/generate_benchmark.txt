@@ -1,0 +1,16 @@
+You are generating a CUDA benchmark program for GPU metric probing.
+
+Target label: {target}
+Requested Nsight Compute metric: {metric_name}
+
+Requirements:
+- Return ONLY raw CUDA source code with no markdown fences.
+- The source must be a complete .cu file with at least one __global__ kernel and a main function.
+- It must compile with: nvcc -O3 -std=c++17.
+- Do not require command-line arguments to run.
+- Launch enough work (threads, blocks, and loop iterations) so Nsight Compute can collect stable counters.
+- Print one JSON object line at the end, for example: {{"status":"ok","elapsed_ms":1.23}}.
+- Do not use #include <cuda/wmma.hpp>.
+
+If there was a previous failure, fix it:
+{error_context}

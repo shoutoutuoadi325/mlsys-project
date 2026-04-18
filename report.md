@@ -3,95 +3,109 @@
 ## Student and Representative Output
 
 Student ID: 23302010025
-Representative output ID: 1b469567f94a0bdd5b147a369a6b3edc
+Representative output ID: d55d8a96cf521018ee69b683c6b0f8ca
 
-This report summarizes the submitted GPU probing agent and the rationale for selecting the representative output ID.
+This report summarizes the updated probing architecture and the rationale for selecting the representative output.
 
 ## Agent Goal
 
-The agent reads a target specification, probes requested hardware-related metrics using CUDA micro-benchmarks and Nsight Compute metrics, and writes one structured output file with numeric results and detailed evidence.
+The agent reads target metrics from /target/target_spec.json, probes each target with an appropriate method (built-in CUDA probe, device attribute query, or Nsight Compute metric probe), and writes one structured output file to /workspace/output.json.
 
-## System Design
+## Updated System Design
 
-### 1. Input and Output Contract
+### 1. Entry and Orchestration
 
-- Target spec input path defaults to /target/target_spec.json.
-- Output path defaults to /workspace/output.json.
-- Output includes numeric results, detailed per-target evidence, runtime summary, and a short reasoning section.
+- run.sh launches python -m agent.main.
+- The main loop loads the target spec, executes per-target probing, and emits one JSON artifact with:
+  - results (numeric summary)
+  - details (method, confidence, evidence, errors)
+  - summary (runtime and success/failure counts)
+  - reasoning (LLM-generated or deterministic fallback)
 
 ### 2. Planning Layer
 
-- A target planner maps each target to one of three execution modes:
-  - built-in probe
-  - device attribute query
-  - ncu metric query
-- The planner can use an LLM plan when API variables are provided.
-- If LLM planning is unavailable, deterministic fallback rules are used.
+- TargetPlanner maps each target to one of three plan kinds:
+  - builtin_probe
+  - device_attribute
+  - ncu_metric
+- Planner behavior:
+  - Uses LLM planning when API_KEY and BASE_MODEL are available.
+  - Falls back to deterministic rules when LLM is unavailable or plan validation fails.
 
-### 3. Probing Layer
+### 3. Probing Layer (Architecture Change)
 
-- Built-in probes are used for targets like SM count and other hardware-intrinsic quantities.
-- Device-attribute probes query CUDA device properties for metrics such as bus width and max frequencies.
-- Nsight Compute probes collect runtime counters (for example DRAM read/write throughput and SOL percentages).
+- Built-in probes and device attribute probes remain deterministic and compiled locally.
+- ncu_metric probing now supports two execution paths:
+  - Preferred path: LLM-generated CUDA benchmark source, compiled and profiled with ncu.
+  - Fallback path: pre-defined static metric workload benchmark.
+- LLM benchmark generation details:
+  - Controlled by LLM_BENCHMARK_ENABLED (default enabled when model/client are available).
+  - Uses prompt-based code generation and compile-retry with error feedback.
+  - Records benchmark_source, benchmark_path, and generation attempts in evidence.
+- If LLM benchmark generation fails, the system automatically falls back and records llm_benchmark_fallback and llm_benchmark_error.
 
 ### 4. Reliability and Failure Handling
 
-- The run writes a valid output file on both success and failure paths.
-- Internal run state is persisted for debugging.
-- If API credentials are absent, the reasoning component falls back to deterministic local summarization.
+- Output is always written in both success and failure paths.
+- Run state and last_error are persisted for debugging.
+- Reasoning generation also has a deterministic fallback when API access is unavailable.
 
 ## Environment Interface
 
-The implementation exposes model interfaces through environment variables:
+The implementation is compatible with evaluation-side model injection through:
 
 - API_KEY
 - BASE_MODEL
 - BASE_URL
 
-This is compatible with evaluation-side model injection.
+Additional runtime controls include:
 
-## Representative Output Selection
+- LLM_BENCHMARK_ENABLED
+- TARGET_SPEC_PATH
+- OUTPUT_PATH
+- STATE_PATH
+- GENERATED_DIR
+- PROMPT_DIR
+- COMPILE_TIMEOUT_S, RUN_TIMEOUT_S, PROFILE_TIMEOUT_S, MAX_TRIALS
 
-I executed multiple submit-test runs and compared successful outputs by:
+## Representative Output Quality
 
-- completion and target success rate
-- numeric completeness (non-null metrics)
-- internal consistency of memory metrics
-- overall run stability
-
-I excluded runs that failed due server-side infrastructure issues (for example Docker image pull timeout), since those do not reflect agent quality.
-
-The selected output ID is:
-
-1b469567f94a0bdd5b147a369a6b3edc
-
-## Result Snapshot of Selected Output
+Selected output file: d55d8a96cf521018ee69b683c6b0f8ca
 
 Run summary:
 
 - target_count: 8
 - success_count: 8
 - failure_count: 0
-- duration_seconds: 30.541779757011682
+- duration_seconds: 85.50667605598574
 
-Key values:
+Key probed values:
 
-- device__attribute_fb_bus_width: 384
-- device__attribute_max_gpu_frequency_khz: 1695000
-- device__attribute_max_mem_frequency_khz: 9751000
+- device__attribute_fb_bus_width: 384 bits
+- device__attribute_max_gpu_frequency_khz: 1695000 kHz
+- device__attribute_max_mem_frequency_khz: 9751000 kHz
 - launch__sm_count: 82
-- gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed: 79.28
-- sm__throughput.avg.pct_of_peak_sustained_elapsed: 10.085
-- dram__bytes_read.sum.per_second: 363089349053.53503
-- dram__bytes_write.sum.per_second: 362352599953.99
+- dram__bytes_read.sum.per_second: 866164729581.405 byte/second
+- dram__bytes_write.sum.per_second: 789058697068.31 byte/second
+- gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed: 13.595 %
+- sm__throughput.avg.pct_of_peak_sustained_elapsed: 82.22 %
 
-These values are coherent for a memory-dominant workload profile, with high memory throughput percentage and much lower SM throughput percentage.
+Validation notes:
 
-## Limitations and Next Improvements
+- All targets have status = ok.
+- No result values are null, negative, or exactly zero.
+- Planning source is LLM for all 8 targets.
+- LLM-generated benchmark path was used for all 4 ncu metrics.
+- No llm_benchmark_fallback occurred in the selected run.
 
-- Some ncu targets are currently measured with a single profiling trial; adding multi-trial median aggregation would improve robustness.
-- Device attribute frequency may not always equal actual sustained boost frequency under lock/throttle settings; adding clock-under-load probes would improve fidelity.
+## Compliance with README Requirements
+
+- /workspace/run.sh exists and runs the agent.
+- Agent reads /target/target_spec.json by default.
+- Agent writes a single output artifact under /workspace/output.json.
+- Model API interface is exposed through API_KEY, BASE_MODEL, BASE_URL.
+- Representative output ID is provided in output_id.txt.
 
 ## Final Submission Artifact
 
-The required representative output ID is provided in output_id.txt.
+The representative output ID is recorded in output_id.txt.
