@@ -3,7 +3,7 @@
 ## Student and Representative Output
 
 Student ID: 23302010025
-Representative output ID: d55d8a96cf521018ee69b683c6b0f8ca
+Representative output ID: 64ee79425df7421281a7f110ac0cb310
 
 This report summarizes the updated probing architecture and the rationale for selecting the representative output.
 
@@ -70,14 +70,14 @@ Additional runtime controls include:
 
 ## Representative Output Quality
 
-Selected output file: d55d8a96cf521018ee69b683c6b0f8ca
+Selected output file: 64ee79425df7421281a7f110ac0cb310
 
 Run summary:
 
 - target_count: 8
 - success_count: 8
 - failure_count: 0
-- duration_seconds: 85.50667605598574
+- duration_seconds: 687.5979469179874
 
 Key probed values:
 
@@ -85,10 +85,10 @@ Key probed values:
 - device__attribute_max_gpu_frequency_khz: 1695000 kHz
 - device__attribute_max_mem_frequency_khz: 9751000 kHz
 - launch__sm_count: 82
-- dram__bytes_read.sum.per_second: 866164729581.405 byte/second
-- dram__bytes_write.sum.per_second: 789058697068.31 byte/second
-- gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed: 13.595 %
-- sm__throughput.avg.pct_of_peak_sustained_elapsed: 82.22 %
+- dram__bytes_read.sum.per_second: 850805207349.38 byte/second
+- dram__bytes_write.sum.per_second: 365250907259.41003 byte/second
+- gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed: 88.63 %
+- sm__throughput.avg.pct_of_peak_sustained_elapsed: 50.82 %
 
 Validation notes:
 
