@@ -114,53 +114,11 @@ curl -X POST http://<server>:8080/start \
 
 ### Returned Information
 
-If successful, you will receive:
+If successful, you will receive your mission ID. Visit the following URL to access your container:
 
-#### 1. SSH Connection
-
-```bash
-ssh root@<server> -p <ssh_port> -i <your_private_key_path>
 ```
-
-* You will log in as **root**
-* `<your_private_key_path>` should be the private key PATH of the public key you submit before.
-* **IMPORTANT: Save the `ssh_port`**, or you will not be able to reconnect
-
----
-
-#### 2. User Ports
-
-To support agent systems, we expose 3 ports:
-
-| Container Port | Host Port |
-| -------------- | --------- |
-| 8080           | mapped    |
-| 8081           | mapped    |
-| 8082           | mapped    |
-
-Example:
-
-```json
-{
-  "ok": true,
-  "user_id": "23210240000",
-  "require_gpu": true,
-  "gpu_id": 0,
-  "ssh_port": 40221,
-  "user_ports": [
-    {"container_port": 8080, "host_port": 40222},
-    {"container_port": 8081, "host_port": 40223},
-    {"container_port": 8082, "host_port": 40224}
-  ]
-}
+curl http://<server>:8080/submit_status/<output_file>
 ```
-
-Use this information to access your environment.
-
-### Workspace
-`/workspace` is a persistent mounted directory tied to your ID, but it is not shared across different servers.
-
----
 
 ## 4. Stop Your Environment
 

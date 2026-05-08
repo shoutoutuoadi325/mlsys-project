@@ -1,7 +1,0 @@
-{
-  "targets": [
-    "physical_sm_count",
-    "actual_core_clock_mhz",
-    "peak_fp32_tflops"
-  ]
-}
