@@ -9,4 +9,4 @@ if ! command -v nvcc >/dev/null 2>&1; then
 	fi
 fi
 
-python -m agent.main
+python3 -m agent.main

@@ -26,6 +26,10 @@ htmlcov/
 .DS_Store
 
 # Generated outputs
+output.json
 output_*.json
 output_id.txt
+output_id2.txt
 *.log
+.generated/
+server_results/

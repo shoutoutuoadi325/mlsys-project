@@ -25,6 +25,14 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    temp_path.replace(path)
+
+
 def extract_last_json_object(text: str) -> dict[str, Any]:
     start = text.rfind("{")
     while start != -1:
