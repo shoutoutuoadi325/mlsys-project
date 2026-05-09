@@ -17,8 +17,8 @@ During execution the agent keeps a valid `optimized_lora.cu` in the submission r
 Useful environment overrides:
 
 ```bash
-LORA_AGENT_MAX_CANDIDATES=6
-LORA_AGENT_BENCH_DIMS=3584,4096
+LORA_AGENT_MAX_CANDIDATES=5
+LORA_AGENT_BENCH_DIMS=3584,4096,4352,4608
 LORA_AGENT_CORRECTNESS_DIMS=256
 LORA_AGENT_WARMUP=4
 LORA_AGENT_ITERS=10

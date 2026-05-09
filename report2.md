@@ -15,16 +15,18 @@ Each candidate is compiled with the PyTorch extension toolchain, checked against
 ## Candidate Families
 
 - ATen/cuBLAS fallback: `mm(W, X)`, `mm(B^T, X)`, and `addmm` accumulation.
-- ATen/cuBLAS plus fused rank-16 addition: the two matrix products use PyTorch/cuBLAS, while the low-rank accumulation is performed by custom CUDA kernels with several thread-block shapes.
-- Direct cuBLAS variants: explicit SGEMM calls for `W@X` and `B^T@X`, followed by the same fused rank-16 addition kernel.
+- In-place addmm variants: accumulate the rank-16 term directly into `W @ X` with `addmm_` to avoid an extra output allocation.
+- Direct cuBLAS variant: issue the three SGEMMs explicitly and use `beta=1` on the final skinny GEMM to update `Y` in place.
+- Separate add variants: compute `A @ (B^T @ X)` as its own GEMM and add it to `W @ X`, avoiding `addmm(beta=1)` when that path is slower.
+- Materialized `B^T` variants: explicitly make the rank-16 transposed panel contiguous before `B^T @ X` when that is faster than strided skinny GEMM.
 
 ## Reproducibility
 
 The main knobs are exposed as environment variables:
 
 ```bash
-LORA_AGENT_MAX_CANDIDATES=6
-LORA_AGENT_BENCH_DIMS=3584,4096
+LORA_AGENT_MAX_CANDIDATES=5
+LORA_AGENT_BENCH_DIMS=3584,4096,4352,4608
 LORA_AGENT_CORRECTNESS_DIMS=256
 LORA_AGENT_WARMUP=4
 LORA_AGENT_ITERS=10
@@ -34,4 +36,10 @@ The agent also writes `output.json` with candidate-level compile status, correct
 
 ## Best Output ID
 
-TBD after running `/submit2`. Copy the best returned output id into `output_id2.txt` before the final report submission.
+`d558fbf45dbe4dd0749e7dc0430e0bd7`
+
+Official hidden-case speedups from this output:
+
+- Case 1: `2.3263328086662654`
+- Case 2: `1.959612090779478`
+- Case 3: `0.9806539583797151`

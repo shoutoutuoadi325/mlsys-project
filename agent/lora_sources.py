@@ -24,20 +24,14 @@ def fallback_candidate() -> LoraCandidate:
 def candidate_suite() -> list[LoraCandidate]:
     candidates = [
         fallback_candidate(),
-        _aten_fused_lowrank_source("aten_fused_lowrank_32x8", block_x=32, block_y=8),
-        _aten_fused_lowrank_source("aten_fused_lowrank_64x4", block_x=64, block_y=4),
-        _aten_fused_lowrank_source("aten_fused_lowrank_16x16", block_x=16, block_y=16),
-        _cublas_fused_lowrank_source(
-            "cublas_fused_lowrank_default",
-            block_x=32,
-            block_y=8,
-            math_mode="default",
+        _aten_addmm_inplace_source(
+            "aten_addmm_inplace_strided_bt",
+            materialize_bt=False,
         ),
-        _cublas_fused_lowrank_source(
-            "cublas_fused_lowrank_pedantic",
-            block_x=32,
-            block_y=8,
-            math_mode="pedantic",
+        _cublas_three_sgemm_source("cublas_three_sgemm_inplace"),
+        _aten_addmm_inplace_source(
+            "aten_addmm_inplace_contiguous_bt",
+            materialize_bt=True,
         ),
     ]
     return candidates
@@ -120,6 +114,239 @@ torch::Tensor forward(torch::Tensor W,
 }
 """
         + _module_footer()
+    )
+
+
+def _aten_addmm_inplace_source(name: str, *, materialize_bt: bool) -> LoraCandidate:
+    bt_expr = "B.transpose(0, 1).contiguous()" if materialize_bt else "B.transpose(0, 1)"
+    source = (
+        _checks_prelude()
+        + f"""
+torch::Tensor forward(torch::Tensor W,
+                      torch::Tensor X,
+                      torch::Tensor A,
+                      torch::Tensor B) {{
+  const auto d = checked_d(W, X, A, B);
+  (void)d;
+  c10::cuda::CUDAGuard device_guard(W.device());
+  torch::NoGradGuard no_grad;
+
+  auto Y = at::mm(W, X);
+  auto BT = {bt_expr};
+  auto T = at::mm(BT, X);
+  Y.addmm_(A, T, 1.0, 1.0);
+  return Y;
+}}
+"""
+        + _module_footer()
+    )
+    return LoraCandidate(
+        name=name,
+        description=(
+            "Compute W@X, then accumulate A@(B^T@X) with in-place addmm_ to avoid "
+            f"an extra output allocation; B^T materialized={materialize_bt}."
+        ),
+        source=source,
+    )
+
+
+def _aten_separate_mm_add_source(name: str, *, materialize_bt: bool) -> LoraCandidate:
+    bt_expr = "B.transpose(0, 1).contiguous()" if materialize_bt else "B.transpose(0, 1)"
+    source = (
+        _checks_prelude()
+        + f"""
+torch::Tensor forward(torch::Tensor W,
+                      torch::Tensor X,
+                      torch::Tensor A,
+                      torch::Tensor B) {{
+  const auto d = checked_d(W, X, A, B);
+  (void)d;
+  c10::cuda::CUDAGuard device_guard(W.device());
+  torch::NoGradGuard no_grad;
+
+  auto Y = at::mm(W, X);
+  auto BT = {bt_expr};
+  auto T = at::mm(BT, X);
+  auto Z = at::mm(A, T);
+  return at::add(Y, Z);
+}}
+"""
+        + _module_footer()
+    )
+    return LoraCandidate(
+        name=name,
+        description=(
+            "Use separate mm(A, B^T@X) and add kernels instead of addmm(beta=1); "
+            f"B^T materialized={materialize_bt}."
+        ),
+        source=source,
+    )
+
+
+def _aten_contiguous_bt_addmm_source() -> LoraCandidate:
+    source = (
+        _checks_prelude()
+        + r"""
+torch::Tensor forward(torch::Tensor W,
+                      torch::Tensor X,
+                      torch::Tensor A,
+                      torch::Tensor B) {
+  const auto d = checked_d(W, X, A, B);
+  (void)d;
+  c10::cuda::CUDAGuard device_guard(W.device());
+  torch::NoGradGuard no_grad;
+
+  auto Y = at::mm(W, X);
+  auto BT = B.transpose(0, 1).contiguous();
+  auto T = at::mm(BT, X);
+  return at::addmm(Y, A, T, 1.0, 1.0);
+}
+"""
+        + _module_footer()
+    )
+    return LoraCandidate(
+        name="aten_contiguous_bt_addmm",
+        description=(
+            "ATen/cuBLAS implementation that materializes the rank-16 B^T panel "
+            "before B^T@X, then uses addmm to fuse A@T into W@X."
+        ),
+        source=source,
+    )
+
+
+def _aten_precompute_delta_source(name: str, *, materialize_bt: bool) -> LoraCandidate:
+    bt_expr = "B.transpose(0, 1).contiguous()" if materialize_bt else "B.transpose(0, 1)"
+    source = (
+        _checks_prelude()
+        + f"""
+torch::Tensor forward(torch::Tensor W,
+                      torch::Tensor X,
+                      torch::Tensor A,
+                      torch::Tensor B) {{
+  const auto d = checked_d(W, X, A, B);
+  (void)d;
+  c10::cuda::CUDAGuard device_guard(W.device());
+  torch::NoGradGuard no_grad;
+
+  auto BT = {bt_expr};
+  auto W_delta = at::addmm(W, A, BT, 1.0, 1.0);
+  return at::mm(W_delta, X);
+}}
+"""
+        + _module_footer()
+    )
+    return LoraCandidate(
+        name=name,
+        description=(
+            "Precompute W + A@B^T with addmm, then run one large W_delta@X GEMM; "
+            f"B^T materialized={materialize_bt}."
+        ),
+        source=source,
+    )
+
+
+def _cublas_three_sgemm_source(name: str) -> LoraCandidate:
+    source = (
+        _checks_prelude(
+            extra_includes=(
+                "#include <ATen/cuda/CUDAContext.h>\n"
+                "#include <c10/cuda/CUDAException.h>\n"
+                "#include <cublas_v2.h>"
+            )
+        )
+        + r"""
+namespace {
+
+#define CUBLAS_CHECK(expr)                                             \
+  do {                                                                \
+    cublasStatus_t status = (expr);                                    \
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS,                       \
+                "cuBLAS call failed with status ", static_cast<int>(status)); \
+  } while (0)
+
+}  // namespace
+
+torch::Tensor forward(torch::Tensor W,
+                      torch::Tensor X,
+                      torch::Tensor A,
+                      torch::Tensor B) {
+  const int d = static_cast<int>(checked_d(W, X, A, B));
+  c10::cuda::CUDAGuard device_guard(W.device());
+  torch::NoGradGuard no_grad;
+
+  auto Y = torch::empty({d, d}, W.options());
+  auto T = torch::empty({kRank, d}, W.options());
+
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  CUBLAS_CHECK(cublasSetStream(handle, stream.stream()));
+
+  const float one = 1.0f;
+  const float zero = 0.0f;
+
+  // Row-major Y = W @ X, interpreted by cuBLAS as column-major Y^T = X^T @ W^T.
+  CUBLAS_CHECK(cublasSgemm(
+      handle,
+      CUBLAS_OP_N,
+      CUBLAS_OP_N,
+      d,
+      d,
+      d,
+      &one,
+      X.data_ptr<float>(),
+      d,
+      W.data_ptr<float>(),
+      d,
+      &zero,
+      Y.data_ptr<float>(),
+      d));
+
+  // Row-major T = B^T @ X, stored as [16, d].
+  CUBLAS_CHECK(cublasSgemm(
+      handle,
+      CUBLAS_OP_N,
+      CUBLAS_OP_T,
+      d,
+      kRank,
+      d,
+      &one,
+      X.data_ptr<float>(),
+      d,
+      B.data_ptr<float>(),
+      kRank,
+      &zero,
+      T.data_ptr<float>(),
+      d));
+
+  // Accumulate row-major Y += A @ T via column-major Y^T += T^T @ A^T.
+  CUBLAS_CHECK(cublasSgemm(
+      handle,
+      CUBLAS_OP_N,
+      CUBLAS_OP_N,
+      d,
+      d,
+      kRank,
+      &one,
+      T.data_ptr<float>(),
+      d,
+      A.data_ptr<float>(),
+      kRank,
+      &one,
+      Y.data_ptr<float>(),
+      d));
+
+  return Y;
+}
+"""
+        + _module_footer()
+    )
+    return LoraCandidate(
+        name=name,
+        description=(
+            "Direct cuBLAS implementation of W@X, B^T@X, and in-place Y += A@T "
+            "to avoid ATen addmm dispatch and out-of-place allocation overhead."
+        ),
+        source=source,
     )
 
 

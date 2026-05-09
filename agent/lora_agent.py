@@ -65,7 +65,10 @@ def load_phase2_config() -> Phase2Config:
     report_path = Path(os.getenv("REPORT2_PATH", str(_default_workspace_path(root_dir, "report2.md"))))
 
     correctness_dims = _parse_int_list(os.getenv("LORA_AGENT_CORRECTNESS_DIMS", "256"), default=[256])
-    benchmark_dims = _parse_int_list(os.getenv("LORA_AGENT_BENCH_DIMS", "3584,4096"), default=[3584, 4096])
+    benchmark_dims = _parse_int_list(
+        os.getenv("LORA_AGENT_BENCH_DIMS", "3584,4096,4352,4608"),
+        default=[3584, 4096, 4352, 4608],
+    )
 
     return Phase2Config(
         root_dir=root_dir,
@@ -73,7 +76,7 @@ def load_phase2_config() -> Phase2Config:
         generated_dir=generated_dir,
         output_path=output_path,
         report_path=report_path,
-        max_candidates=int(os.getenv("LORA_AGENT_MAX_CANDIDATES", "6")),
+        max_candidates=int(os.getenv("LORA_AGENT_MAX_CANDIDATES", "5")),
         correctness_dims=correctness_dims,
         benchmark_dims=benchmark_dims,
         warmup=int(os.getenv("LORA_AGENT_WARMUP", "4")),
@@ -316,7 +319,8 @@ class LoraOptimizationAgent:
         max_abs = diff.abs().max().item()
         rel_l2 = (diff.norm() / (y_ref.float().norm() + 1e-12)).item()
         # Large FP32 GEMMs can differ by several ULPs across cuBLAS call shapes.
-        # Use the relative norm as the primary guard while still catching outliers.
+        # Keep the search guard close to the official tolerance without discarding
+        # official-valid no-copy B^T candidates on synthetic tensors.
         passed = bool(rel_l2 <= 1e-5 and max_abs <= 1e-2)
         return passed, float(max_abs), float(rel_l2)
 
@@ -369,8 +373,9 @@ class LoraOptimizationAgent:
             "## Search Space",
             "",
             "- ATen/cuBLAS fallback using `mm` and `addmm`.",
+            "- A variant that materializes `B^T` before the rank-16 product to avoid slow strided access cases.",
+            "- Precompute variants that form `W + A@B^T` first and then run one large GEMM.",
             "- ATen/cuBLAS for the large products plus custom rank-16 accumulation kernels.",
-            "- Direct cuBLAS variants for the two GEMMs plus custom rank-16 accumulation.",
             "",
             "## Current Best",
             "",

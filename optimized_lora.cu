@@ -55,7 +55,8 @@ torch::Tensor forward(torch::Tensor W,
 
   auto Y = at::mm(W, X);
   auto T = at::mm(B.transpose(0, 1), X);
-  return at::addmm(Y, A, T, 1.0, 1.0);
+  Y.addmm_(A, T, 1.0, 1.0);
+  return Y;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
