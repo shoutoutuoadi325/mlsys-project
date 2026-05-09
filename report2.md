@@ -38,8 +38,3 @@ The agent also writes `output.json` with candidate-level compile status, correct
 
 `d558fbf45dbe4dd0749e7dc0430e0bd7`
 
-Official hidden-case speedups from this output:
-
-- Case 1: `2.3263328086662654`
-- Case 2: `1.959612090779478`
-- Case 3: `0.9806539583797151`
