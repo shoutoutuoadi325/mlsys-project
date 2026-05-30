@@ -1,0 +1,7 @@
+我什么都没做，代码已经在 workspace/engine.py 里了。
+Existing engine implementation: workspace/engine.py
+Read model config: target/model_config.json
+Model type: tiny_llama
+Layers: 2
+Hidden size: 64
+Weight file: target/weights/model.pt

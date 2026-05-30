@@ -1,0 +1,11 @@
+Generate a new CUDA benchmark program for GPU performance profiling. e.g. matmul. 
+
+Description: {description}
+
+The program should be a complete CUDA source file (.cu) including kernel and main.
+It should compile with nvcc and be suited for Nsight Compute profiling.
+Do not use `#include <cuda/wmma.hpp>` in the generated code.
+
+If there was an error in the previous iteration, fix the issue and produce working CUDA code.
+
+Return ONLY the raw CUDA source file content without any Markdown fences or additional commentary.
