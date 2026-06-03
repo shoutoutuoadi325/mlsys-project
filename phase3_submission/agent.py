@@ -122,6 +122,9 @@ class Engine:
 
         self.causal_masks = {}
         self.requests = {}
+        self.varlen_k_cache = None
+        self.varlen_v_cache = None
+        self.varlen_mask = None
         if self.device.type == "cuda" and hasattr(torch, "compile"):
             try:
                 self._forward_prefill_batch = torch.compile(
@@ -203,8 +206,20 @@ class Engine:
                 raise KeyError(f"unknown request_id {rid}; call prefill first")
             groups.setdefault(self.requests[rid].length, []).append(out_idx)
 
+        if len(groups) == 1:
+            with torch.inference_mode():
+                return self._decode_group(
+                    request_ids,
+                    tokens,
+                )
+
         outputs = [None] * len(request_ids)
         with torch.inference_mode():
+            if len(groups) > 1:
+                return self._decode_varlen_group(
+                    request_ids,
+                    tokens,
+                )
             for _, out_indices in groups.items():
                 group_rids = [request_ids[i] for i in out_indices]
                 group_tokens = tokens[out_indices].to(device=self.device, dtype=torch.long)
@@ -247,6 +262,34 @@ class Engine:
             block.keys[layer_idx] = k_buf
             block.values[layer_idx] = v_buf
         block.capacity = new_capacity
+
+    def _varlen_buffers(self, batch, seqlen):
+        if (
+            self.varlen_k_cache is None
+            or self.varlen_k_cache.shape[0] < batch
+            or self.varlen_k_cache.shape[2] < seqlen
+        ):
+            batch_capacity = batch
+            seqlen_capacity = self._initial_capacity(seqlen)
+            if self.varlen_k_cache is not None:
+                batch_capacity = max(batch_capacity, self.varlen_k_cache.shape[0] * 2)
+                seqlen_capacity = max(seqlen_capacity, self.varlen_k_cache.shape[2] * 2)
+            self.varlen_k_cache = torch.empty(
+                (batch_capacity, self.num_kv_heads, seqlen_capacity, self.head_dim),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self.varlen_v_cache = torch.empty_like(self.varlen_k_cache)
+            self.varlen_mask = torch.empty(
+                (batch_capacity, 1, 1, seqlen_capacity),
+                device=self.device,
+                dtype=self.dtype,
+            )
+        return (
+            self.varlen_k_cache[:batch, :, :seqlen, :],
+            self.varlen_v_cache[:batch, :, :seqlen, :],
+            self.varlen_mask[:batch, :, :, :seqlen],
+        )
 
     def _normalize_input_ids(self, input_ids):
         if torch.is_tensor(input_ids):
@@ -351,6 +394,18 @@ class Engine:
             q.unsqueeze(2),
             k_full,
             v_full,
+            dropout_p=0.0,
+            is_causal=False,
+        ).squeeze(2)
+
+    def _attention_decode_masked(self, q, k, v, mask):
+        k_full = self._repeat_kv(k)
+        v_full = self._repeat_kv(v)
+        return F.scaled_dot_product_attention(
+            q.unsqueeze(2),
+            k_full,
+            v_full,
+            attn_mask=mask,
             dropout_p=0.0,
             is_causal=False,
         ).squeeze(2)
@@ -461,6 +516,94 @@ class Engine:
                 )
 
             y = self._attention_decode(q, k_cache, v_cache)
+            y = y.contiguous().view(batch, self.hidden_size)
+            y = F.linear(y, o_w)
+            x = residual + y
+
+            residual = x
+            x_norm = self._rmsnorm(x, post_norm_w)
+            gate_up = F.linear(x_norm, gate_up_w)
+            gate, up = gate_up.chunk(2, dim=-1)
+            hidden = F.silu(gate) * up
+            mlp_out = F.linear(hidden, down_w)
+            x = residual + mlp_out
+
+        for state in states:
+            state.length += 1
+
+        x = self._rmsnorm(x, self.norm_weight)
+        return F.linear(x, self.lm_head_weight)
+
+    def _decode_varlen_group(self, request_ids, token_ids):
+        states = [self.requests[rid] for rid in request_ids]
+        batch = len(states)
+        old_lengths = [state.length for state in states]
+        new_lengths = [length + 1 for length in old_lengths]
+        max_new_len = max(new_lengths)
+        for state, new_len in zip(states, new_lengths):
+            self._ensure_capacity(state, new_len)
+
+        runs = []
+        run_start = 0
+        while run_start < batch:
+            first_state = states[run_start]
+            run_block = first_state.block
+            run_old_len = old_lengths[run_start]
+            run_row = first_state.row
+            run_end = run_start + 1
+            while run_end < batch:
+                state = states[run_end]
+                if (
+                    state.block is not run_block
+                    or old_lengths[run_end] != run_old_len
+                    or state.row != run_row + (run_end - run_start)
+                ):
+                    break
+                run_end += 1
+            runs.append((run_start, run_end, run_block, run_row, run_old_len, run_old_len + 1))
+            run_start = run_end
+
+        positions = torch.tensor(old_lengths, device=self.device, dtype=torch.long)
+        key_positions = torch.arange(max_new_len, device=self.device)[None, :]
+        lengths_tensor = torch.tensor(new_lengths, device=self.device)[:, None]
+        k_cache, v_cache, mask = self._varlen_buffers(batch, max_new_len)
+        mask.copy_(
+            torch.where(
+                key_positions < lengths_tensor,
+                torch.zeros((), device=self.device, dtype=self.dtype),
+                torch.full((), float("-inf"), device=self.device, dtype=self.dtype),
+            )[:, None, None, :]
+        )
+
+        x = self.embed_weight[token_ids].view(batch, self.hidden_size)
+
+        for layer_idx in range(self.num_layers):
+            input_norm_w, post_norm_w, qkv_w, o_w, gate_up_w, down_w = self.layers[layer_idx]
+
+            residual = x
+            x_norm = self._rmsnorm(x, input_norm_w)
+
+            qkv = F.linear(x_norm, qkv_w)
+            q, k_new, v_new = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
+
+            q = q.view(batch, self.num_heads, self.head_dim)
+            k_new = k_new.view(batch, self.num_kv_heads, self.head_dim)
+            v_new = v_new.view(batch, self.num_kv_heads, self.head_dim)
+            q, k_new = self._apply_rope_decode(q, k_new, positions)
+
+            for start, end, block, row, old_len, new_len in runs:
+                layer_k = block.keys[layer_idx]
+                layer_v = block.values[layer_idx]
+                layer_k[row : row + end - start, :, old_len, :].copy_(k_new[start:end])
+                layer_v[row : row + end - start, :, old_len, :].copy_(v_new[start:end])
+                k_cache[start:end, :, :new_len, :].copy_(
+                    layer_k[row : row + end - start, :, :new_len, :]
+                )
+                v_cache[start:end, :, :new_len, :].copy_(
+                    layer_v[row : row + end - start, :, :new_len, :]
+                )
+
+            y = self._attention_decode_masked(q, k_cache, v_cache, mask)
             y = y.contiguous().view(batch, self.hidden_size)
             y = F.linear(y, o_w)
             x = residual + y
