@@ -1,8 +1,15 @@
 import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
-ENGINE_SOURCE = r'''
+BASELINE_ENGINE_SOURCE = r'''
 import math
 import os
 
@@ -21,20 +28,6 @@ def load_state_dict(weight_path):
         return torch.load(weight_path, map_location="cpu")
 
 
-class CacheBlock:
-    def __init__(self, capacity, keys, values):
-        self.capacity = capacity
-        self.keys = keys
-        self.values = values
-
-
-class RequestState:
-    def __init__(self, length, block, row):
-        self.length = length
-        self.block = block
-        self.row = row
-
-
 class Engine:
     def __init__(self, config, weight_dir, device):
         if device == "auto":
@@ -46,18 +39,10 @@ class Engine:
         self.device = torch.device(device)
         self.dtype = self._select_dtype(config)
 
-        if self.device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.allow_tf32 = False
-        try:
-            torch.set_float32_matmul_precision("highest")
-        except Exception:
-            pass
-
         weight_path = os.path.join(weight_dir, "model.pt")
         state_dict = load_state_dict(weight_path)
         self.w = {
-            name: tensor.to(device=self.device, dtype=self.dtype).contiguous()
+            name: tensor.to(device=self.device, dtype=self.dtype)
             for name, tensor in state_dict.items()
         }
 
@@ -68,71 +53,11 @@ class Engine:
         self.hidden_size = int(config["hidden_size"])
         self.eps = float(config.get("rms_norm_eps", 1e-5))
         self.rope_theta = float(config.get("rope_theta", 10000.0))
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
 
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
-        self.kv_repeat = self.num_heads // self.num_kv_heads
-        self.embed_weight = self.w["embed_tokens.weight"]
-        self.norm_weight = self.w["norm.weight"]
-        self.lm_head_weight = self.w["lm_head.weight"]
-        self.layers = []
-        for layer_idx in range(self.num_layers):
-            prefix = f"layers.{layer_idx}"
-            qkv_weight = torch.cat(
-                [
-                    self.w[f"{prefix}.self_attn.q_proj.weight"],
-                    self.w[f"{prefix}.self_attn.k_proj.weight"],
-                    self.w[f"{prefix}.self_attn.v_proj.weight"],
-                ],
-                dim=0,
-            ).contiguous()
-            gate_up_weight = torch.cat(
-                [
-                    self.w[f"{prefix}.mlp.gate_proj.weight"],
-                    self.w[f"{prefix}.mlp.up_proj.weight"],
-                ],
-                dim=0,
-            ).contiguous()
-            self.layers.append(
-                (
-                    self.w[f"{prefix}.input_layernorm.weight"],
-                    self.w[f"{prefix}.post_attention_layernorm.weight"],
-                    qkv_weight,
-                    self.w[f"{prefix}.self_attn.o_proj.weight"],
-                    gate_up_weight,
-                    self.w[f"{prefix}.mlp.down_proj.weight"],
-                )
-            )
-            for suffix in (
-                "self_attn.q_proj.weight",
-                "self_attn.k_proj.weight",
-                "self_attn.v_proj.weight",
-                "mlp.gate_proj.weight",
-                "mlp.up_proj.weight",
-            ):
-                self.w.pop(f"{prefix}.{suffix}", None)
 
-        max_positions = int(config.get("max_position_embeddings", 2048))
-        self.rope_cos = None
-        self.rope_sin = None
-        self._build_rope_cache(max(max_positions, 16))
-
-        self.causal_masks = {}
         self.requests = {}
-        self.varlen_k_cache = None
-        self.varlen_v_cache = None
-        self.varlen_mask = None
-        if self.device.type == "cuda" and hasattr(torch, "compile"):
-            try:
-                self._forward_prefill_batch = torch.compile(
-                    self._forward_prefill_batch,
-                    mode="reduce-overhead",
-                )
-            except Exception:
-                pass
 
     def _select_dtype(self, config):
         if self.device.type != "cuda":
@@ -144,152 +69,40 @@ class Engine:
         return torch.float16
 
     def prefill(self, request_ids, input_ids):
-        request_ids = [int(rid) for rid in request_ids]
-        inputs = self._normalize_input_ids(input_ids)
-        if len(request_ids) == 0:
-            vocab = int(self.config["vocab_size"])
-            return torch.empty((0, vocab), device=self.device, dtype=self.dtype)
-        if len(request_ids) != len(inputs):
-            raise ValueError("request_ids and input_ids must have the same length")
+        input_list = self._normalize_input_ids(input_ids)
+        outputs = []
 
-        groups = {}
-        for out_idx, (rid, ids) in enumerate(zip(request_ids, inputs)):
-            ids = ids.to(device=self.device, dtype=torch.long).reshape(-1)
-            if ids.numel() == 0:
-                raise ValueError("prefill input_ids must be non-empty")
-            groups.setdefault(int(ids.numel()), []).append((out_idx, rid, ids))
+        for rid, ids in zip(request_ids, input_list):
+            rid = int(rid)
+            ids = ids.to(device=self.device, dtype=torch.long)
+            self.requests[rid] = ids.clone()
 
-        outputs = [None] * len(request_ids)
-        with torch.inference_mode():
-            for seqlen, items in groups.items():
-                batch_ids = torch.stack([ids for _, _, ids in items], dim=0)
-                logits, keys, values = self._forward_prefill_batch(batch_ids)
-
-                capacity = self._initial_capacity(seqlen)
-                block_keys = []
-                block_values = []
-                for layer_idx in range(self.num_layers):
-                    k_buf = torch.empty(
-                        (len(items), self.num_kv_heads, capacity, self.head_dim),
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    v_buf = torch.empty_like(k_buf)
-                    k_buf[:, :, :seqlen, :].copy_(keys[layer_idx])
-                    v_buf[:, :, :seqlen, :].copy_(values[layer_idx])
-                    block_keys.append(k_buf)
-                    block_values.append(v_buf)
-                block = CacheBlock(capacity=capacity, keys=block_keys, values=block_values)
-
-                for local_idx, (out_idx, rid, _) in enumerate(items):
-                    self.requests[rid] = RequestState(
-                        length=seqlen,
-                        block=block,
-                        row=local_idx,
-                    )
-                    outputs[out_idx] = logits[local_idx]
+            logits = self._forward_full(ids.unsqueeze(0))
+            outputs.append(logits[0, -1, :])
 
         return torch.stack(outputs, dim=0)
 
     def decode(self, request_ids, token_ids):
-        request_ids = [int(rid) for rid in request_ids]
-        tokens = self._normalize_token_ids(token_ids)
-        if len(request_ids) == 0:
-            vocab = int(self.config["vocab_size"])
-            return torch.empty((0, vocab), device=self.device, dtype=self.dtype)
-        if len(request_ids) != int(tokens.numel()):
-            raise ValueError("request_ids and token_ids must have the same length")
+        token_ids = self._normalize_token_ids(token_ids)
+        outputs = []
 
-        groups = {}
-        for out_idx, rid in enumerate(request_ids):
+        for rid, token in zip(request_ids, token_ids):
+            rid = int(rid)
             if rid not in self.requests:
                 raise KeyError(f"unknown request_id {rid}; call prefill first")
-            groups.setdefault(self.requests[rid].length, []).append(out_idx)
 
-        if len(groups) == 1:
-            with torch.inference_mode():
-                return self._decode_group(
-                    request_ids,
-                    tokens,
-                )
+            token = token.reshape(1).to(device=self.device, dtype=torch.long)
+            ids = torch.cat([self.requests[rid], token], dim=0)
+            self.requests[rid] = ids
 
-        outputs = [None] * len(request_ids)
-        with torch.inference_mode():
-            if len(groups) > 1:
-                return self._decode_varlen_group(
-                    request_ids,
-                    tokens,
-                )
-            for _, out_indices in groups.items():
-                group_rids = [request_ids[i] for i in out_indices]
-                group_tokens = tokens[out_indices].to(device=self.device, dtype=torch.long)
-                logits = self._decode_group(group_rids, group_tokens)
-                for local_idx, out_idx in enumerate(out_indices):
-                    outputs[out_idx] = logits[local_idx]
+            logits = self._forward_full(ids.unsqueeze(0))
+            outputs.append(logits[0, -1, :])
 
         return torch.stack(outputs, dim=0)
 
     def remove(self, request_ids):
         for rid in request_ids:
             self.requests.pop(int(rid), None)
-
-    def _initial_capacity(self, length):
-        capacity = 16
-        target = int(length) + 16
-        while capacity < target:
-            capacity *= 2
-        return capacity
-
-    def _ensure_capacity(self, state, needed_length):
-        block = state.block
-        if needed_length <= block.capacity:
-            return
-        old_capacity = block.capacity
-        new_capacity = old_capacity
-        while new_capacity < needed_length:
-            new_capacity *= 2
-        for layer_idx in range(self.num_layers):
-            old_k = block.keys[layer_idx]
-            old_v = block.values[layer_idx]
-            k_buf = torch.empty(
-                (old_k.shape[0], self.num_kv_heads, new_capacity, self.head_dim),
-                device=self.device,
-                dtype=self.dtype,
-            )
-            v_buf = torch.empty_like(k_buf)
-            k_buf[:, :, :old_capacity, :].copy_(old_k[:, :, :old_capacity, :])
-            v_buf[:, :, :old_capacity, :].copy_(old_v[:, :, :old_capacity, :])
-            block.keys[layer_idx] = k_buf
-            block.values[layer_idx] = v_buf
-        block.capacity = new_capacity
-
-    def _varlen_buffers(self, batch, seqlen):
-        if (
-            self.varlen_k_cache is None
-            or self.varlen_k_cache.shape[0] < batch
-            or self.varlen_k_cache.shape[2] < seqlen
-        ):
-            batch_capacity = batch
-            seqlen_capacity = self._initial_capacity(seqlen)
-            if self.varlen_k_cache is not None:
-                batch_capacity = max(batch_capacity, self.varlen_k_cache.shape[0] * 2)
-                seqlen_capacity = max(seqlen_capacity, self.varlen_k_cache.shape[2] * 2)
-            self.varlen_k_cache = torch.empty(
-                (batch_capacity, self.num_kv_heads, seqlen_capacity, self.head_dim),
-                device=self.device,
-                dtype=self.dtype,
-            )
-            self.varlen_v_cache = torch.empty_like(self.varlen_k_cache)
-            self.varlen_mask = torch.empty(
-                (batch_capacity, 1, 1, seqlen_capacity),
-                device=self.device,
-                dtype=self.dtype,
-            )
-        return (
-            self.varlen_k_cache[:batch, :, :seqlen, :],
-            self.varlen_v_cache[:batch, :, :seqlen, :],
-            self.varlen_mask[:batch, :, :, :seqlen],
-        )
 
     def _normalize_input_ids(self, input_ids):
         if torch.is_tensor(input_ids):
@@ -300,42 +113,8 @@ class Engine:
 
     def _normalize_token_ids(self, token_ids):
         if torch.is_tensor(token_ids):
-            return token_ids.to(device=self.device, dtype=torch.long).reshape(-1)
-        return torch.tensor(list(token_ids), device=self.device, dtype=torch.long).reshape(-1)
-
-    def _build_rope_cache(self, length):
-        inv_freq = 1.0 / (
-            self.rope_theta
-            ** (
-                torch.arange(0, self.head_dim, 2, device=self.device, dtype=torch.float32)
-                / self.head_dim
-            )
-        )
-        positions = torch.arange(length, device=self.device, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        self.rope_cos = freqs.cos()
-        self.rope_sin = freqs.sin()
-
-    def _ensure_rope(self, needed_length):
-        if needed_length <= int(self.rope_cos.shape[0]):
-            return
-        new_length = max(needed_length, int(self.rope_cos.shape[0]) * 2)
-        self._build_rope_cache(new_length)
-
-    def _causal_mask(self, seqlen):
-        mask = self.causal_masks.get(seqlen)
-        if mask is None or mask.device != self.device:
-            mask = torch.triu(
-                torch.full(
-                    (seqlen, seqlen),
-                    float("-inf"),
-                    device=self.device,
-                    dtype=torch.float32,
-                ),
-                diagonal=1,
-            )[None, None, :, :]
-            self.causal_masks[seqlen] = mask
-        return mask
+            return [x for x in token_ids.reshape(-1)]
+        return [torch.tensor(x, device=self.device, dtype=torch.long) for x in token_ids]
 
     def _rmsnorm(self, x, weight):
         x_float = x.float()
@@ -343,360 +122,484 @@ class Engine:
         x_norm = x_float * torch.rsqrt(variance + self.eps)
         return x_norm.to(x.dtype) * weight
 
-    def _apply_rope_prefill(self, q, k, seqlen):
-        self._ensure_rope(seqlen)
-        cos = self.rope_cos[:seqlen].to(dtype=q.dtype)[None, None, :, :]
-        sin = self.rope_sin[:seqlen].to(dtype=q.dtype)[None, None, :, :]
-        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
-
-    def _apply_rope_decode(self, q, k, positions):
-        max_position = int(positions.max().item()) + 1
-        self._ensure_rope(max_position)
-        cos = self.rope_cos.index_select(0, positions).to(dtype=q.dtype)[:, None, :]
-        sin = self.rope_sin.index_select(0, positions).to(dtype=q.dtype)[:, None, :]
-        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
-
-    def _apply_rope_decode_position(self, q, k, position):
-        self._ensure_rope(position + 1)
-        cos = self.rope_cos[position].to(dtype=q.dtype)[None, None, :]
-        sin = self.rope_sin[position].to(dtype=q.dtype)[None, None, :]
-        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
-
-    def _rotate(self, x, cos, sin):
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        x_rotated = torch.stack(
-            (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos),
-            dim=-1,
+    def _apply_rope(self, q, k, seqlen):
+        dim = q.shape[-1]
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, dim, 2, device=self.device, dtype=torch.float32) / dim)
         )
-        return x_rotated.flatten(-2)
+        positions = torch.arange(seqlen, device=self.device, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        cos = freqs.cos().to(q.dtype)[None, None, :, :]
+        sin = freqs.sin().to(q.dtype)[None, None, :, :]
 
-    def _repeat_kv(self, x):
-        if self.kv_repeat == 1:
-            return x
-        return x.repeat_interleave(self.kv_repeat, dim=1)
+        def rotate(x):
+            x_even = x[..., 0::2]
+            x_odd = x[..., 1::2]
+            x_rotated = torch.stack(
+                (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos),
+                dim=-1,
+            )
+            return x_rotated.flatten(-2)
 
-    def _attention_prefill(self, q, k, v):
-        k_full = self._repeat_kv(k)
-        v_full = self._repeat_kv(v)
-        return F.scaled_dot_product_attention(
-            q,
-            k_full,
-            v_full,
-            dropout_p=0.0,
-            is_causal=True,
-        )
+        return rotate(q), rotate(k)
 
-    def _attention_decode(self, q, k, v):
-        k_full = self._repeat_kv(k)
-        v_full = self._repeat_kv(v)
-        return F.scaled_dot_product_attention(
-            q.unsqueeze(2),
-            k_full,
-            v_full,
-            dropout_p=0.0,
-            is_causal=False,
-        ).squeeze(2)
-
-    def _attention_decode_masked(self, q, k, v, mask):
-        k_full = self._repeat_kv(k)
-        v_full = self._repeat_kv(v)
-        return F.scaled_dot_product_attention(
-            q.unsqueeze(2),
-            k_full,
-            v_full,
-            attn_mask=mask,
-            dropout_p=0.0,
-            is_causal=False,
-        ).squeeze(2)
-
-    def _forward_prefill_batch(self, input_ids):
-        x = self.embed_weight[input_ids]
+    def _forward_full(self, input_ids):
+        x = self.w["embed_tokens.weight"][input_ids]
         batch, seqlen, _ = x.shape
-        all_keys = []
-        all_values = []
+
+        causal_mask = torch.triu(
+            torch.full(
+                (seqlen, seqlen),
+                float("-inf"),
+                device=self.device,
+                dtype=torch.float32,
+            ),
+            diagonal=1,
+        )[None, None, :, :]
 
         for layer_idx in range(self.num_layers):
-            input_norm_w, post_norm_w, qkv_w, o_w, gate_up_w, down_w = self.layers[layer_idx]
+            prefix = f"layers.{layer_idx}"
 
             residual = x
-            x_norm = self._rmsnorm(x, input_norm_w)
+            x_norm = self._rmsnorm(x, self.w[f"{prefix}.input_layernorm.weight"])
 
-            qkv = F.linear(x_norm, qkv_w)
-            q, k, v = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
+            q = F.linear(x_norm, self.w[f"{prefix}.self_attn.q_proj.weight"])
+            k = F.linear(x_norm, self.w[f"{prefix}.self_attn.k_proj.weight"])
+            v = F.linear(x_norm, self.w[f"{prefix}.self_attn.v_proj.weight"])
 
             q = q.view(batch, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
             k = k.view(batch, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
             v = v.view(batch, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            q, k = self._apply_rope_prefill(q, k, seqlen)
-            k = k.contiguous()
-            v = v.contiguous()
-            all_keys.append(k)
-            all_values.append(v)
 
-            y = self._attention_prefill(q, k, v)
+            q, k = self._apply_rope(q, k, seqlen)
+
+            if self.num_kv_heads != self.num_heads:
+                repeat = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+
+            attn = torch.matmul(q.float(), k.float().transpose(-1, -2))
+            attn = attn / math.sqrt(self.head_dim)
+            attn = attn + causal_mask
+            attn = torch.softmax(attn, dim=-1).to(x.dtype)
+
+            y = torch.matmul(attn, v)
             y = y.transpose(1, 2).contiguous().view(batch, seqlen, self.hidden_size)
-            y = F.linear(y, o_w)
+            y = F.linear(y, self.w[f"{prefix}.self_attn.o_proj.weight"])
             x = residual + y
 
             residual = x
-            x_norm = self._rmsnorm(x, post_norm_w)
-            gate_up = F.linear(x_norm, gate_up_w)
-            gate, up = gate_up.chunk(2, dim=-1)
+            x_norm = self._rmsnorm(x, self.w[f"{prefix}.post_attention_layernorm.weight"])
+            gate = F.linear(x_norm, self.w[f"{prefix}.mlp.gate_proj.weight"])
+            up = F.linear(x_norm, self.w[f"{prefix}.mlp.up_proj.weight"])
             hidden = F.silu(gate) * up
-            mlp_out = F.linear(hidden, down_w)
+            mlp_out = F.linear(hidden, self.w[f"{prefix}.mlp.down_proj.weight"])
             x = residual + mlp_out
 
-        x = self._rmsnorm(x, self.norm_weight)
-        return F.linear(x[:, -1, :], self.lm_head_weight), all_keys, all_values
+        x = self._rmsnorm(x, self.w["norm.weight"])
+        return F.linear(x, self.w["lm_head.weight"])
+'''
 
-    def _decode_group(self, request_ids, token_ids):
-        states = [self.requests[rid] for rid in request_ids]
-        batch = len(states)
-        old_len = states[0].length
-        new_len = old_len + 1
-        for state in states:
-            self._ensure_capacity(state, new_len)
-        first_block = states[0].block
-        same_block = all(state.block is first_block for state in states)
-        rows = [state.row for state in states]
-        row_start = rows[0]
-        contiguous_rows = same_block and rows == list(range(row_start, row_start + batch))
-        row_tensor = None
-        if same_block and not contiguous_rows:
-            row_tensor = torch.tensor(rows, device=self.device, dtype=torch.long)
 
-        x = self.embed_weight[token_ids].view(batch, self.hidden_size)
+SYSTEM_PROMPT = """You are an MLSys Phase 3 code-generation agent.
+Generate one complete Python file named engine.py for a decoder-only LLaMA-like runtime.
+Return only Python code, with no Markdown fences and no explanation."""
 
-        for layer_idx in range(self.num_layers):
-            input_norm_w, post_norm_w, qkv_w, o_w, gate_up_w, down_w = self.layers[layer_idx]
 
-            residual = x
-            x_norm = self._rmsnorm(x, input_norm_w)
+def canonical_weight_schema(config):
+    num_layers = int(config.get("num_hidden_layers", 0) or 0)
+    keys = ["embed_tokens.weight"]
+    layer_templates = [
+        "layers.{i}.input_layernorm.weight",
+        "layers.{i}.self_attn.q_proj.weight",
+        "layers.{i}.self_attn.k_proj.weight",
+        "layers.{i}.self_attn.v_proj.weight",
+        "layers.{i}.self_attn.o_proj.weight",
+        "layers.{i}.post_attention_layernorm.weight",
+        "layers.{i}.mlp.gate_proj.weight",
+        "layers.{i}.mlp.up_proj.weight",
+        "layers.{i}.mlp.down_proj.weight",
+    ]
+    if num_layers:
+        for i in range(num_layers):
+            keys.extend(template.format(i=i) for template in layer_templates)
+    else:
+        keys.extend(layer_templates)
+    keys.extend(["norm.weight", "lm_head.weight"])
+    return "\n".join(f"- {key}" for key in keys)
 
-            qkv = F.linear(x_norm, qkv_w)
-            q, k_new, v_new = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
 
-            q = q.view(batch, self.num_heads, self.head_dim)
-            k_new = k_new.view(batch, self.num_kv_heads, self.head_dim)
-            v_new = v_new.view(batch, self.num_kv_heads, self.head_dim)
-            q, k_new = self._apply_rope_decode_position(q, k_new, old_len)
-
-            if contiguous_rows:
-                layer_k = first_block.keys[layer_idx]
-                layer_v = first_block.values[layer_idx]
-                layer_k[row_start : row_start + batch, :, old_len, :].copy_(k_new)
-                layer_v[row_start : row_start + batch, :, old_len, :].copy_(v_new)
-                k_cache = layer_k[row_start : row_start + batch, :, :new_len, :]
-                v_cache = layer_v[row_start : row_start + batch, :, :new_len, :]
-            elif same_block:
-                layer_k = first_block.keys[layer_idx]
-                layer_v = first_block.values[layer_idx]
-                layer_k[:, :, old_len, :].index_copy_(0, row_tensor, k_new)
-                layer_v[:, :, old_len, :].index_copy_(0, row_tensor, v_new)
-                k_cache = layer_k[:, :, :new_len, :].index_select(0, row_tensor)
-                v_cache = layer_v[:, :, :new_len, :].index_select(0, row_tensor)
-            else:
-                for idx, state in enumerate(states):
-                    state.block.keys[layer_idx][state.row, :, old_len, :].copy_(k_new[idx])
-                    state.block.values[layer_idx][state.row, :, old_len, :].copy_(v_new[idx])
-                k_cache = torch.stack(
-                    [
-                        state.block.keys[layer_idx][state.row, :, :new_len, :]
-                        for state in states
-                    ],
-                    dim=0,
-                )
-                v_cache = torch.stack(
-                    [
-                        state.block.values[layer_idx][state.row, :, :new_len, :]
-                        for state in states
-                    ],
-                    dim=0,
-                )
-
-            y = self._attention_decode(q, k_cache, v_cache)
-            y = y.contiguous().view(batch, self.hidden_size)
-            y = F.linear(y, o_w)
-            x = residual + y
-
-            residual = x
-            x_norm = self._rmsnorm(x, post_norm_w)
-            gate_up = F.linear(x_norm, gate_up_w)
-            gate, up = gate_up.chunk(2, dim=-1)
-            hidden = F.silu(gate) * up
-            mlp_out = F.linear(hidden, down_w)
-            x = residual + mlp_out
-
-        for state in states:
-            state.length += 1
-
-        x = self._rmsnorm(x, self.norm_weight)
-        return F.linear(x, self.lm_head_weight)
-
-    def _decode_varlen_group(self, request_ids, token_ids):
-        states = [self.requests[rid] for rid in request_ids]
-        batch = len(states)
-        old_lengths = [state.length for state in states]
-        new_lengths = [length + 1 for length in old_lengths]
-        max_new_len = max(new_lengths)
-        for state, new_len in zip(states, new_lengths):
-            self._ensure_capacity(state, new_len)
-
-        runs = []
-        run_start = 0
-        while run_start < batch:
-            first_state = states[run_start]
-            run_block = first_state.block
-            run_old_len = old_lengths[run_start]
-            run_row = first_state.row
-            run_end = run_start + 1
-            while run_end < batch:
-                state = states[run_end]
-                if (
-                    state.block is not run_block
-                    or old_lengths[run_end] != run_old_len
-                    or state.row != run_row + (run_end - run_start)
-                ):
-                    break
-                run_end += 1
-            runs.append((run_start, run_end, run_block, run_row, run_old_len, run_old_len + 1))
-            run_start = run_end
-
-        positions = torch.tensor(old_lengths, device=self.device, dtype=torch.long)
-        key_positions = torch.arange(max_new_len, device=self.device)[None, :]
-        lengths_tensor = torch.tensor(new_lengths, device=self.device)[:, None]
-        k_cache, v_cache, mask = self._varlen_buffers(batch, max_new_len)
-        mask.copy_(
-            torch.where(
-                key_positions < lengths_tensor,
-                torch.zeros((), device=self.device, dtype=self.dtype),
-                torch.full((), float("-inf"), device=self.device, dtype=self.dtype),
-            )[:, None, None, :]
+def load_weight_schema(root, config):
+    candidates = [
+        root / "target" / "weights" / "model.pt",
+        Path("/target/weights/model.pt"),
+    ]
+    weight_path = next((path for path in candidates if path.exists()), candidates[0])
+    if not weight_path.exists():
+        return (
+            f"Weight file not available at generation time. Use this required naming pattern:\n"
+            f"{canonical_weight_schema(config)}"
         )
 
-        x = self.embed_weight[token_ids].view(batch, self.hidden_size)
+    try:
+        import torch
 
-        for layer_idx in range(self.num_layers):
-            input_norm_w, post_norm_w, qkv_w, o_w, gate_up_w, down_w = self.layers[layer_idx]
+        try:
+            state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            state_dict = torch.load(weight_path, map_location="cpu")
+        lines = [f"Observed weight file: {weight_path}", "Exact state_dict keys and shapes:"]
+        for name, tensor in state_dict.items():
+            shape = tuple(int(x) for x in getattr(tensor, "shape", ()))
+            lines.append(f"- {name}: {shape}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return (
+            f"Could not inspect {weight_path}: {exc}\n"
+            f"Use this required naming pattern:\n{canonical_weight_schema(config)}"
+        )
 
-            residual = x
-            x_norm = self._rmsnorm(x, input_norm_w)
 
-            qkv = F.linear(x_norm, qkv_w)
-            q, k_new, v_new = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
+def build_runtime_prompt(config, weight_schema):
+    config_text = json.dumps(config, indent=2, sort_keys=True) if config else "{}"
+    return textwrap.dedent(
+        f"""
+        Build workspace/engine.py for Phase 3 Automated LLM Inference Runtime.
 
-            q = q.view(batch, self.num_heads, self.head_dim)
-            k_new = k_new.view(batch, self.num_kv_heads, self.head_dim)
-            v_new = v_new.view(batch, self.num_kv_heads, self.head_dim)
-            q, k_new = self._apply_rope_decode(q, k_new, positions)
+        Required public interface:
+        - def create_engine(model_config: dict, weight_dir: str, device: str = "cuda")
+        - Engine.prefill(request_ids, input_ids) -> logits [batch, vocab_size].
+          input_ids is a Python list of 1D torch.Tensor sequences, not a padded tensor.
+        - Engine.decode(request_ids, token_ids) -> logits [batch, vocab_size].
+          token_ids is a 1D torch.Tensor with one token per request.
+        - Engine.remove(request_ids) -> None
 
-            for start, end, block, row, old_len, new_len in runs:
-                layer_k = block.keys[layer_idx]
-                layer_v = block.values[layer_idx]
-                layer_k[row : row + end - start, :, old_len, :].copy_(k_new[start:end])
-                layer_v[row : row + end - start, :, old_len, :].copy_(v_new[start:end])
-                k_cache[start:end, :, :new_len, :].copy_(
-                    layer_k[row : row + end - start, :, :new_len, :]
-                )
-                v_cache[start:end, :, :new_len, :].copy_(
-                    layer_v[row : row + end - start, :, :new_len, :]
-                )
+        Correctness contract:
+        - Load weight_dir/model.pt as a PyTorch state_dict.
+        - Use exactly the state_dict key names listed below. Do not guess HuggingFace names
+          such as model.embed_tokens.weight, tok_embeddings.weight, wte.weight, q_proj.bias,
+          or any key that is not listed.
+        - Match the reference logits within torch.allclose atol=1e-2, rtol=1e-2.
+        - Correctness is more important than speed. If an optimized KV-cache implementation
+          is uncertain, generate a full-recompute implementation that is exactly correct.
+        - Use model_config dynamically; do not hard-code dimensions from this public config.
+        - prefill creates or replaces only the listed request states.
+        - decode appends exactly one token to each listed existing request.
+        - remove deletes finished request states without disturbing others.
 
-            y = self._attention_decode_masked(q, k_cache, v_cache, mask)
-            y = y.contiguous().view(batch, self.hidden_size)
-            y = F.linear(y, o_w)
-            x = residual + y
+        Exact model math required:
+        - LLaMA-like decoder-only stack.
+        - embed_tokens.weight lookup.
+        - RMSNorm: x_float = x.float(); variance = x_float.pow(2).mean(dim=-1, keepdim=True);
+          output = (x_float * torch.rsqrt(variance + rms_norm_eps)).to(x.dtype) * weight.
+        - Per layer: input RMSNorm, q/k/v projections with F.linear(x_norm, weight) and no bias.
+        - q shape is [batch, num_attention_heads, seqlen, head_dim].
+        - k/v shape is [batch, num_key_value_heads, seqlen, head_dim].
+        - RoPE uses even/odd pairs:
+          x_even=x[...,0::2], x_odd=x[...,1::2],
+          rotated stack is (x_even*cos - x_odd*sin, x_even*sin + x_odd*cos), then flatten last dims.
+        - RoPE positions are absolute token positions starting at 0 for prefill and current
+          cached length for decode.
+        - Causal attention for full sequences is:
+          attn = torch.matmul(q.float(), k.float().transpose(-1, -2)) / sqrt(head_dim)
+          then add an upper-triangular -inf mask, softmax over last dim, cast to x.dtype.
+        - For decode with KV cache, attention over all cached keys is not causal-masked because
+          the query is only the newest token and may attend to the whole prefix plus itself.
+        - Then o projection, residual, post-attention RMSNorm, SwiGLU MLP with gate/up/down, residual.
+        - Support num_attention_heads != num_key_value_heads by repeating KV heads.
+        - Final RMSNorm and lm_head.weight projection.
+        - Use float32 for RMSNorm variance and attention softmax stability as needed.
 
-            residual = x
-            x_norm = self._rmsnorm(x, post_norm_w)
-            gate_up = F.linear(x_norm, gate_up_w)
-            gate, up = gate_up.chunk(2, dim=-1)
-            hidden = F.silu(gate) * up
-            mlp_out = F.linear(hidden, down_w)
-            x = residual + mlp_out
+        Engineering goal:
+        - A simple full-recompute implementation is acceptable only as a fallback, but you
+          should generate an optimized runtime.
+        - Implement a per-layer KV cache keyed by request_id, so decode computes only the
+          new token and appends one K/V vector per layer.
+        - Batch same-length prefill requests and return logits in caller order.
+        - In decode, group requests by current cache length when useful. Preserve caller order.
+        - Precompute or cache RoPE cos/sin tables. Grow them dynamically for hidden traces.
+        - Avoid torch.nn.functional.scaled_dot_product_attention unless you are certain its
+          masking and dtype behavior matches the explicit reference above.
+        - Minimize Python overhead without sacrificing correctness.
+        - Avoid imports outside the Python standard library and torch.
+        - Return syntactically valid, fully indented Python code only.
 
-        for state in states:
-            state.length += 1
+        Public config observed by the agent:
+        {config_text}
 
-        x = self._rmsnorm(x, self.norm_weight)
-        return F.linear(x, self.lm_head_weight)
-'''
+        State dict schema observed by the agent:
+        {weight_schema}
+        """
+    ).strip()
+
+
+def extract_python_code(text):
+    match = re.search(r"```(?:python|py)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        text = match.group(1)
+    text = text.strip()
+    if "def create_engine" not in text or "class Engine" not in text:
+        raise ValueError("candidate does not define the required engine interface")
+    return text + "\n"
+
+
+def call_deepseek_api(prompt):
+    api_key = os.environ.get("API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        return None, "no DeepSeek API key found in API_KEY or DEEPSEEK_API_KEY"
+
+    base_url = (
+        os.environ.get("BASE_URL")
+        or os.environ.get("DEEPSEEK_BASE_URL")
+        or "https://api.deepseek.com"
+    )
+    model = os.environ.get("BASE_MODEL") or os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
+
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+        return extract_python_code(content), f"generated by DeepSeek model {model} via {endpoint}"
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as exc:
+        return None, f"DeepSeek generation failed: {exc}"
+
+
+def generate_candidate_with_repair(prompt, root, engine_path):
+    attempts = []
+    candidate, note = call_deepseek_api(prompt)
+    attempts.append(note)
+    if candidate is None:
+        return None, "\n".join(attempts)
+
+    max_validations = 4
+    for attempt in range(max_validations):
+        try:
+            syntax_check(candidate, engine_path)
+            engine_path.write_text(candidate, encoding="utf-8")
+            ok, validation = run_public_correctness(root, engine_path)
+            attempts.append(validation)
+            if ok:
+                return candidate, "\n".join(attempts)
+            if attempt == max_validations - 1:
+                break
+            repair_prompt = textwrap.dedent(
+                f"""
+                The generated engine.py failed validation. Produce a corrected complete
+                engine.py. Return only Python code.
+
+                Validation failure:
+                {validation}
+
+                Important reminders:
+                - prefill input_ids is list[torch.Tensor], not a tensor with .shape.
+                - Use only the exact state_dict keys listed in the original task.
+                - Match the explicit RMSNorm, RoPE, causal attention, and SwiGLU math from
+                  the original task. Correct full recompute is better than a wrong KV cache.
+
+                Original task:
+                {prompt}
+                """
+            ).strip()
+            candidate, note = call_deepseek_api(repair_prompt)
+            attempts.append(note)
+            if candidate is None:
+                break
+        except Exception as exc:
+            attempts.append(f"candidate validation failed: {exc}")
+            if attempt == max_validations - 1:
+                break
+            repair_prompt = textwrap.dedent(
+                f"""
+                The generated engine.py failed before correctness testing. Produce a corrected
+                complete engine.py. Return only Python code.
+
+                Error:
+                {exc}
+
+                Important reminders:
+                - Return syntactically valid, fully indented Python.
+                - prefill input_ids is list[torch.Tensor], not a tensor with .shape.
+                - Use only the exact state_dict keys listed in the original task.
+                - Correct full recompute is better than a wrong optimized runtime.
+
+                Original task:
+                {prompt}
+                """
+            ).strip()
+            candidate, note = call_deepseek_api(repair_prompt)
+            attempts.append(note)
+            if candidate is None:
+                break
+
+    return None, "\n".join(attempts)
+
+
+def syntax_check(source, path):
+    compile(source, str(path), "exec")
+
+
+def run_public_correctness(root, engine_path):
+    evaluator = root / "evaluator" / "test_correctness.py"
+    config = root / "target" / "model_config.json"
+    weights = root / "target" / "weights"
+    if not evaluator.exists() or not config.exists() or not weights.exists():
+        return True, "public correctness test not available in this directory"
+
+    cmd = [
+        sys.executable,
+        str(evaluator),
+        "--engine",
+        str(engine_path),
+        "--model-config",
+        str(config),
+        "--weight-dir",
+        str(weights),
+        "--device",
+        "auto",
+    ]
+    proc = subprocess.run(cmd, cwd=root, text=True, capture_output=True, timeout=240)
+    if proc.returncode == 0:
+        return True, proc.stdout.strip()
+    return False, (proc.stdout + "\n" + proc.stderr).strip()
+
+
+def read_config(root):
+    for path in (root / "target" / "model_config.json", Path("/target/model_config.json")):
+        if path.exists():
+            with path.open() as f:
+                return json.load(f), path
+    return {}, root / "target" / "model_config.json"
+
+
+def build_output_report(
+    config,
+    config_path,
+    weight_schema,
+    engine_source,
+    decision,
+    validation_log,
+):
+    report = "\n".join(
+        [
+            "# Phase 3 Agent Output",
+            "",
+            "The agent generated `workspace/engine.py` during `run.sh`.",
+            "",
+            "Generation strategy:",
+            "- Keep one embedded correctness baseline as a fallback.",
+            "- Ask the DeepSeek-compatible course API for an optimized runtime when credentials are available.",
+            "- Accept a generated candidate only after interface extraction, Python syntax validation,",
+            "  and the public correctness test when the public evaluator is present.",
+            "- If validation fails, ask the model once more with the concrete error before falling back.",
+            "- Fall back to the single baseline if generation or validation fails.",
+            "",
+            f"Decision: {decision}",
+            f"Generated engine size: {len(engine_source)} bytes",
+            f"Config path used: {config_path}",
+            "",
+            "Validation log:",
+            "",
+            "```text",
+            validation_log,
+            "```",
+            "",
+            "Observed config:",
+            "",
+            "```json",
+            json.dumps(config, indent=2, sort_keys=True) if config else "{}",
+            "```",
+            "",
+            "Runtime prompt:",
+            "",
+            "```text",
+            build_runtime_prompt(config, weight_schema),
+            "```",
+        ]
+    )
+    return report + "\n"
 
 
 def main():
     root = Path(__file__).resolve().parent
     workspace = root / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-
-    config_candidates = [
-        root / "target" / "model_config.json",
-        Path("/target/model_config.json"),
-    ]
-    weight_candidates = [
-        root / "target" / "weights" / "model.pt",
-        Path("/target/weights/model.pt"),
-    ]
-    config_path = next((path for path in config_candidates if path.exists()), config_candidates[0])
-    weight_path = next((path for path in weight_candidates if path.exists()), weight_candidates[0])
-    config = {}
-    if config_path.exists():
-        with config_path.open() as f:
-            config = json.load(f)
-
-    engine_source = ENGINE_SOURCE.lstrip() + "\n"
     engine_path = workspace / "engine.py"
-    engine_path.write_text(engine_source, encoding="utf-8")
-    root_engine_path = root / "engine.py"
-    if root.name == "workspace":
-        root_engine_path.write_text(engine_source, encoding="utf-8")
+    extra_engine_paths = []
+    extra_output_paths = []
+    if root.name == "workspace" or str(root) == "/workspace":
+        extra_engine_paths.append(root / "engine.py")
+        extra_output_paths.append(root / "output3.md")
 
-    config_json = json.dumps(config, indent=2) if config else "{}"
-    report = "\n".join(
-        [
-            "# Phase 3 Agent Output",
-            "",
-            "Generated `workspace/engine.py` from a reproducible agent.",
-            "",
-            "Engineering notes:",
-            "- Runtime dimensions come from `create_engine(model_config, weight_dir, device)`.",
-            "- Prefill is batched by equal prompt length and writes per-layer KV cache.",
-            "- Decode groups requests by current cache length and computes only the new token.",
-            "- Request replacement, removal, insertion, and caller output order are handled explicitly.",
-            "- Attention math mirrors the public reference implementation for correctness stability.",
-            "",
-            "Public config seen by agent:",
-            "",
-            "```json",
-            config_json,
-            "```",
-            "",
-            f"Config path used: {config_path}",
-            f"Weight file present at generation time: {weight_path.exists()}",
-            f"Weight path checked: {weight_path}",
-        ]
+    config, config_path = read_config(root)
+    weight_schema = load_weight_schema(root, config)
+    prompt = build_runtime_prompt(config, weight_schema)
+
+    baseline_source = BASELINE_ENGINE_SOURCE.lstrip() + "\n"
+    candidate_source, generation_note = generate_candidate_with_repair(prompt, root, engine_path)
+
+    decision = "baseline fallback"
+    validation_log = generation_note
+    engine_source = baseline_source
+
+    if candidate_source is not None:
+        try:
+            syntax_check(candidate_source, engine_path)
+            engine_path.write_text(candidate_source, encoding="utf-8")
+            decision = "accepted DeepSeek-generated candidate"
+            engine_source = candidate_source
+            validation_log = generation_note
+        except Exception as exc:
+            validation_log = f"{generation_note}\nCandidate validation failed: {exc}"
+            engine_path.write_text(baseline_source, encoding="utf-8")
+    else:
+        engine_path.write_text(baseline_source, encoding="utf-8")
+
+    syntax_check(engine_source, engine_path)
+    engine_path.write_text(engine_source, encoding="utf-8")
+    for path in extra_engine_paths:
+        path.write_text(engine_source, encoding="utf-8")
+
+    output_report = build_output_report(
+        config,
+        config_path,
+        weight_schema,
+        engine_source,
+        decision,
+        validation_log,
     )
-    output_text = report + "\n"
-    (workspace / "output3.md").write_text(output_text, encoding="utf-8")
-    if root.name == "workspace":
-        (root / "output3.md").write_text(output_text, encoding="utf-8")
+    (workspace / "output3.md").write_text(output_report, encoding="utf-8")
+    for path in extra_output_paths:
+        path.write_text(output_report, encoding="utf-8")
 
     print(f"generated {engine_path}")
     print(f"generated {workspace / 'output3.md'}")
-    if root.name == "workspace":
-        print(f"generated {root_engine_path}")
-        print(f"generated {root / 'output3.md'}")
-    if config:
-        print(
-            "config: "
-            f"layers={config.get('num_hidden_layers')}, "
-            f"hidden={config.get('hidden_size')}, "
-            f"heads={config.get('num_attention_heads')}, "
-            f"kv_heads={config.get('num_key_value_heads')}, "
-            f"vocab={config.get('vocab_size')}"
-        )
-    else:
-        print("config: target/model_config.json not present during local generation")
+    for path in extra_engine_paths:
+        print(f"generated {path}")
+    for path in extra_output_paths:
+        print(f"generated {path}")
+    print(f"decision: {decision}")
+    print(validation_log)
 
 
 if __name__ == "__main__":
