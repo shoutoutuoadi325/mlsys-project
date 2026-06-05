@@ -1,31 +1,87 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Virtual environments
-.venv/
+# Virtual Environments
+.env
+.venv
+env/
 venv/
 ENV/
+env.bak/
+venv.bak/
 
-# Packaging
-build/
-dist/
-*.egg-info/
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# Test/coverage
+# Pytest / Coverage
 .pytest_cache/
 .coverage
 htmlcov/
 
-# IDE/editor
+# C / C++ / CUDA
+*.o
+*.ko
+*.obj
+*.elf
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# Machine Learning / Deep Learning files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.hdf5
+*.onnx
+*.bin
+*.weights
+models/
+checkpoints/
+data/
+datasets/
+
+# Logs & Outputs
+*.log
+logs/
+
+# IDEs and Editors
 .vscode/
 .idea/
-
-# OS
-.DS_Store
-
-# Generated outputs
-output_*.json
-output_id.txt
-*.log
+*.swp
+*.swo
+*~
